@@ -29,6 +29,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/xtaci/lossyconn"
 )
 
 var testKey = bytes.Repeat([]byte{0x42}, 32)
@@ -42,6 +44,106 @@ func testConfig() Config {
 type filterStream struct {
 	io.ReadWriteCloser
 	filter func([]byte) []byte
+}
+
+type lossyPacketStream struct {
+	conn    *lossyconn.LossyConn
+	peer    net.Addr
+	onRead  func([]byte)
+	onWrite func([]byte)
+}
+
+type raptorqMessageStats struct {
+	seen    map[uint32]struct{}
+	symbols uint64
+	bytes   uint64
+}
+
+type raptorqInputStats struct {
+	mu       sync.Mutex
+	messages map[[16]byte]*raptorqMessageStats
+	sentIDs  map[uint32][16]byte
+}
+
+func (s *raptorqInputStats) record(packet []byte) {
+	f, ok := parsedDataFrame(packet)
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.messages == nil {
+		s.messages = make(map[[16]byte]*raptorqMessageStats)
+	}
+	stats := s.messages[f.id]
+	if stats == nil {
+		stats = &raptorqMessageStats{seen: make(map[uint32]struct{})}
+		s.messages[f.id] = stats
+	}
+	if _, ok := stats.seen[f.index]; ok {
+		return
+	}
+	stats.seen[f.index] = struct{}{}
+	stats.symbols++
+	stats.bytes += uint64(len(f.payload))
+}
+
+func (s *raptorqInputStats) recordSent(packet []byte) {
+	f, ok := parsedDataFrame(packet)
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sentIDs == nil {
+		s.sentIDs = make(map[uint32][16]byte)
+	}
+	s.sentIDs[f.messageLen] = f.id
+}
+
+func parsedDataFrame(packet []byte) (frame, bool) {
+	if len(packet) < 1 || packet[len(packet)-1] != 0 {
+		return frame{}, false
+	}
+	f, err := parseFrame(packet[:len(packet)-1], testKey)
+	if err != nil || f.kind != frameData || len(f.payload) != int(f.symbolSize) {
+		return frame{}, false
+	}
+	return f, true
+}
+
+func (s *raptorqInputStats) messageID(messageLen uint32) [16]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sentIDs[messageLen]
+}
+
+func (s *raptorqInputStats) snapshot(id [16]byte) (symbols, bytes uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if stats := s.messages[id]; stats != nil {
+		return stats.symbols, stats.bytes
+	}
+	return 0, 0
+}
+
+func (s *lossyPacketStream) Read(p []byte) (int, error) {
+	n, _, err := s.conn.ReadFrom(p)
+	if n > 0 && s.onRead != nil {
+		s.onRead(p[:n])
+	}
+	return n, err
+}
+
+func (s *lossyPacketStream) Write(p []byte) (int, error) {
+	if s.onWrite != nil {
+		s.onWrite(p)
+	}
+	return s.conn.WriteTo(p, s.peer)
+}
+
+func (s *lossyPacketStream) Close() error {
+	return s.conn.Close()
 }
 
 // Write applies the test filter to simulate frame corruption or loss.
@@ -73,6 +175,35 @@ func pair(t *testing.T, leftFilter, rightFilter func([]byte) []byte) (*Link, *Li
 	return left, right
 }
 
+func lossyPair(t *testing.T, cfg lossyconn.Config, linkCfg Config, inputStats *raptorqInputStats) (*Link, *Link, *lossyconn.LossyConn, *lossyconn.LossyConn) {
+	t.Helper()
+	leftConn, err := lossyconn.NewWithConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightCfg := cfg
+	rightCfg.Seed++
+	rightConn, err := lossyconn.NewWithConfig(rightCfg)
+	if err != nil {
+		_ = leftConn.Close()
+		t.Fatal(err)
+	}
+	left, err := New(&lossyPacketStream{conn: leftConn, peer: rightConn.LocalAddr(), onWrite: inputStats.recordSent}, linkCfg)
+	if err != nil {
+		_ = leftConn.Close()
+		_ = rightConn.Close()
+		t.Fatal(err)
+	}
+	right, err := New(&lossyPacketStream{conn: rightConn, peer: leftConn.LocalAddr(), onRead: inputStats.record}, linkCfg)
+	if err != nil {
+		_ = left.Close()
+		_ = rightConn.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = left.Close(); _ = right.Close() })
+	return left, right, leftConn, rightConn
+}
+
 // frameFromPacket verifies and decodes a framed packet in a test filter.
 func frameFromPacket(t *testing.T, p []byte) frame {
 	t.Helper()
@@ -86,14 +217,18 @@ func frameFromPacket(t *testing.T, p []byte) frame {
 	return f
 }
 
-// TestSendReceiveRetriesAndAuthentication checks retries after corruption and lost ACKs.
-func TestSendReceiveRetriesAndAuthentication(t *testing.T) {
+// TestSendReceiveRepairSymbols checks repair symbols recover a corrupted source
+// symbol and that acknowledgments are sent only after message completion.
+func TestSendReceiveRepairSymbols(t *testing.T) {
 	var mu sync.Mutex
 	seen := map[uint32]int{}
-	ackSeen := map[uint32]int{}
-	// Corrupt the first data frame and drop the second symbol's first ACK.
+	ackSeen := 0
+	// Corrupt the first source symbol and drop the first completion ACK.
 	left, right := pair(t, func(p []byte) []byte {
 		f := frameFromPacket(t, p)
+		if f.kind != frameData {
+			return p
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		seen[f.index]++
@@ -103,10 +238,13 @@ func TestSendReceiveRetriesAndAuthentication(t *testing.T) {
 		return p
 	}, func(p []byte) []byte {
 		f := frameFromPacket(t, p)
+		if f.kind != frameAck {
+			return p
+		}
 		mu.Lock()
 		defer mu.Unlock()
-		ackSeen[f.index]++
-		if f.index == 1 && ackSeen[f.index] == 1 {
+		ackSeen++
+		if ackSeen == 1 {
 			return nil
 		}
 		return p
@@ -123,13 +261,17 @@ func TestSendReceiveRetriesAndAuthentication(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if seen[0] < 2 || seen[1] < 2 || len(seen) < 3 {
-		t.Fatalf("expected per-symbol retries and multiple symbols: %v", seen)
-	}
-	for i := range seen {
-		if ackSeen[i] == 0 {
-			t.Fatalf("symbol %d was not acknowledged", i)
+	sourceSymbols := (len(msg) + left.symbolSize() - 1) / left.symbolSize()
+	for i := 0; i < sourceSymbols; i++ {
+		if seen[uint32(i)] != 1 {
+			t.Fatalf("source symbol %d was sent %d times, want exactly once: %v", i, seen[uint32(i)], seen)
 		}
+	}
+	if len(seen) <= sourceSymbols {
+		t.Fatalf("expected repair symbols after source loss: %v", seen)
+	}
+	if ackSeen < 2 {
+		t.Fatalf("expected completion ACK retry after loss, got %d ACKs", ackSeen)
 	}
 }
 
@@ -199,7 +341,7 @@ func TestTimeoutAndCancellation(t *testing.T) {
 	}
 }
 
-// TestAcknowledgmentHMACRequired checks that corrupted ACKs cannot complete a send.
+// TestAcknowledgmentHMACRequired checks that corrupted completion ACKs are rejected.
 func TestAcknowledgmentHMACRequired(t *testing.T) {
 	left, _ := pair(t, nil, func(p []byte) []byte {
 		p[5] ^= 0x40
@@ -208,8 +350,8 @@ func TestAcknowledgmentHMACRequired(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	err := left.Send(ctx, []byte("data"))
-	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("acknowledgment timeout")) {
-		t.Fatalf("Send = %v, want acknowledgment timeout", err)
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("message acknowledgment timeout")) {
+		t.Fatalf("Send = %v, want message acknowledgment timeout", err)
 	}
 }
 
@@ -254,8 +396,8 @@ func TestEchoCannotAcknowledgeOwnMessage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	err = link.Send(ctx, []byte("echo"))
-	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("acknowledgment timeout")) {
-		t.Fatalf("Send = %v, want acknowledgment timeout", err)
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("message acknowledgment timeout")) {
+		t.Fatalf("Send = %v, want message acknowledgment timeout", err)
 	}
 	short, stop := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer stop()
@@ -279,6 +421,143 @@ func TestLargeMessage(t *testing.T) {
 	}
 }
 
+// TestLossyTransportMessageSizes exercises retransmission and reassembly across
+// a matrix of bidirectional packet-loss rates and reports simulator statistics.
+func TestLossyTransportMessageSizes(t *testing.T) {
+	scenarios := []struct {
+		name       string
+		loss       float64
+		corruption float64
+		seed       int64
+	}{
+		{name: "loss_20pct", loss: 0.20, seed: 20261111},
+		{name: "loss_40pct", loss: 0.40, seed: 20261112},
+		{name: "loss_60pct", loss: 0.60, seed: 20261113},
+		{name: "loss_20pct_corruption_10pct", loss: 0.20, corruption: 0.10, seed: 20261114},
+	}
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			testLossyMessageSizes(t, scenario.loss, scenario.corruption, scenario.seed)
+		})
+	}
+}
+
+func testLossyMessageSizes(t *testing.T, lossRate, corruptionRate float64, seed int64) {
+	t.Helper()
+	lossCfg := lossyconn.Config{
+		Delay:          2 * time.Millisecond,
+		DelayDeviation: 0.5,
+		RandomLossRate: lossRate,
+		CorruptionRate: corruptionRate,
+		MaxPacketSize:  255,
+		Seed:           seed,
+	}
+	linkCfg := testConfig()
+	// Each encoded frame is one lossyconn datagram, so the protocol's frame
+	// limit must not exceed the simulated link's packet-size limit.
+	linkCfg.MaxFrameSize = lossCfg.MaxPacketSize
+	linkCfg.AckTimeout = 20 * time.Millisecond
+	linkCfg.MaxRetries = 100
+	inputStats := &raptorqInputStats{}
+	left, right, leftConn, rightConn := lossyPair(t, lossCfg, linkCfg, inputStats)
+	symbolSize := left.symbolSize()
+	if symbolSize <= 0 {
+		t.Fatalf("invalid symbol size %d for max frame size %d", symbolSize, linkCfg.MaxFrameSize)
+	}
+	maxFrame := marshalFrame(frame{
+		kind:       frameData,
+		messageLen: ^uint32(0),
+		symbolSize: uint16(symbolSize),
+		payload:    bytes.Repeat([]byte{0xff}, symbolSize),
+	}, testKey)
+	if len(maxFrame) > lossCfg.MaxPacketSize {
+		t.Fatalf("maximum encoded frame size %d exceeds link packet limit %d", len(maxFrame), lossCfg.MaxPacketSize)
+	}
+	sizes := []int{1, 128, 4096, 16384}
+	var totalRandomDrops, totalBurstDrops, totalCorrupted, totalDataCorrupted uint64
+	var totalInputBytes, totalRestoredBytes, totalWireBytes uint64
+	testStart := time.Now()
+
+	for _, size := range sizes {
+		msg := make([]byte, size)
+		for i := range msg {
+			msg[i] = byte(i*31 + size)
+		}
+
+		beforeLeft, beforeRight := leftConn.Stats(), rightConn.Stats()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		start := time.Now()
+		sendErr := left.Send(ctx, msg)
+		if sendErr != nil {
+			cancel()
+			t.Fatalf("Send(%d bytes): %v", size, sendErr)
+		}
+		got, receiveErr := right.Receive(ctx)
+		cancel()
+		elapsed := time.Since(start)
+		if receiveErr != nil || !bytes.Equal(got, msg) {
+			t.Fatalf("Receive(%d bytes): got %d bytes, err %v", size, len(got), receiveErr)
+		}
+
+		afterLeft, afterRight := leftConn.Stats(), rightConn.Stats()
+		messageID := inputStats.messageID(uint32(size))
+		inputSymbols, inputBytes := inputStats.snapshot(messageID)
+		dataPackets := afterLeft.SentPackets - beforeLeft.SentPackets
+		ackPackets := afterRight.SentPackets - beforeRight.SentPackets
+		dataSymbols := uint64((size + left.symbolSize() - 1) / left.symbolSize())
+		if inputSymbols < dataSymbols || inputBytes != inputSymbols*uint64(symbolSize) {
+			t.Fatalf("message_bytes=%d: RaptorQ received %d unique symbols (%d bytes), need at least %d symbols",
+				size, inputSymbols, inputBytes, dataSymbols)
+		}
+		wireBytes := afterLeft.SentBytes - beforeLeft.SentBytes
+		randomDrops := afterLeft.DropRandom - beforeLeft.DropRandom +
+			afterRight.DropRandom - beforeRight.DropRandom
+		burstDrops := afterLeft.DropBurst - beforeLeft.DropBurst +
+			afterRight.DropBurst - beforeRight.DropBurst
+		corruptedPackets := afterLeft.CorruptedPackets - beforeLeft.CorruptedPackets +
+			afterRight.CorruptedPackets - beforeRight.CorruptedPackets
+		dataCorruptedPackets := afterLeft.CorruptedPackets - beforeLeft.CorruptedPackets
+		oversizeDrops := afterLeft.DropOversize - beforeLeft.DropOversize +
+			afterRight.DropOversize - beforeRight.DropOversize
+		if oversizeDrops != 0 {
+			t.Fatalf("message_bytes=%d produced %d frames over link packet limit %d",
+				size, oversizeDrops, lossCfg.MaxPacketSize)
+		}
+		repairSymbols := dataPackets - dataSymbols
+		totalRandomDrops += randomDrops
+		totalBurstDrops += burstDrops
+		totalCorrupted += corruptedPackets
+		totalDataCorrupted += dataCorruptedPackets
+		totalInputBytes += inputBytes
+		totalRestoredBytes += uint64(len(got))
+		totalWireBytes += wireBytes
+		throughputMbps := float64(size*8) / elapsed.Seconds() / 1e6
+		raptorqEfficiency := float64(len(got)) / float64(inputBytes) * 100
+		wireEfficiency := float64(len(got)) / float64(wireBytes) * 100
+		t.Logf("loss_rate=%.0f%% corruption_rate=%.0f%% message_bytes=%d symbol_bytes=%d source_symbols=%d raptorq_received_symbols=%d raptorq_input_bytes=%d restored_bytes=%d raptorq_efficiency=%.2f%% wire_bytes_with_repairs=%d wire_efficiency=%.2f%% max_frame_bytes=%d link_packet_limit=%d duration=%s throughput=%.3fMbps data_packets=%d repair_symbols=%d completion_ack_packets=%d random_drops=%d burst_drops=%d data_corrupted_packets=%d corrupted_packets=%d",
+			lossRate*100, corruptionRate*100, size, symbolSize, dataSymbols, inputSymbols, inputBytes, len(got), raptorqEfficiency,
+			wireBytes, wireEfficiency, len(maxFrame), lossCfg.MaxPacketSize,
+			elapsed.Round(time.Millisecond), throughputMbps, dataPackets, repairSymbols, ackPackets,
+			randomDrops, burstDrops, dataCorruptedPackets, corruptedPackets)
+	}
+
+	if totalRandomDrops+totalBurstDrops == 0 {
+		t.Fatal("loss simulation produced no packet drops")
+	}
+	totalDuration := time.Since(testStart)
+	if corruptionRate > 0 && totalDataCorrupted == 0 {
+		t.Fatal("corruption simulation produced no corrupted data packets")
+	}
+	t.Logf("TOTAL loss_rate=%.0f%% corruption_rate=%.0f%% messages=%d raptorq_input_bytes=%d restored_bytes=%d raptorq_efficiency=%.2f%% data_wire_bytes_with_retries=%d wire_efficiency=%.2f%% duration=%s throughput=%.3fMbps random_drops=%d burst_drops=%d data_corrupted_packets=%d corrupted_packets=%d",
+		lossRate*100, corruptionRate*100,
+		len(sizes), totalInputBytes, totalRestoredBytes,
+		float64(totalRestoredBytes)/float64(totalInputBytes)*100,
+		totalWireBytes, float64(totalRestoredBytes)/float64(totalWireBytes)*100,
+		totalDuration.Round(time.Millisecond),
+		float64(totalRestoredBytes*8)/totalDuration.Seconds()/1e6,
+		totalRandomDrops, totalBurstDrops, totalDataCorrupted, totalCorrupted)
+}
+
 // TestFrameEncoding checks COBS boundary cases and HMAC key verification.
 func TestFrameEncoding(t *testing.T) {
 	for _, n := range []int{0, 1, 253, 254, 255, 512} {
@@ -300,6 +579,28 @@ func TestFrameEncoding(t *testing.T) {
 	p := marshalFrame(f, testKey)
 	if _, err := parseFrame(p[:len(p)-1], bytes.Repeat([]byte{1}, 32)); err == nil {
 		t.Fatal("wrong HMAC key accepted")
+	}
+}
+
+func TestFrameHMACProtectsSourceAndRepairSymbols(t *testing.T) {
+	for _, index := range []uint32{0, 1} {
+		f := frame{
+			kind:       frameData,
+			index:      index,
+			messageLen: 3,
+			symbolSize: 3,
+			payload:    []byte("abc"),
+		}
+		packet := marshalFrame(f, testKey)
+		raw, err := cobsDecode(packet[:len(packet)-1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw[headerSize] ^= 0x01
+		corrupted := cobsEncode(raw)
+		if _, err := parseFrame(corrupted, testKey); err == nil {
+			t.Fatalf("corrupted symbol payload accepted for symbol ID %d", index)
+		}
 	}
 }
 

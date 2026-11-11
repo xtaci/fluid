@@ -31,20 +31,31 @@ const (
 	protocolVersion = 1
 	frameData       = 1
 	frameAck        = 2
-	headerSize      = 28
-	macSize         = sha256.Size
+	headerSize      = 28          // 1 version + 1 kind + 16 ID + 4 index + 4 message length + 2 symbol size
+	macSize         = sha256.Size // HMAC-SHA256 length in bytes
 )
 
 type frame struct {
 	kind       byte
 	id         [16]byte
-	index      uint32
+	index      uint32 // RaptorQ source or repair symbol ID.
 	messageLen uint32
 	symbolSize uint16
 	payload    []byte
 }
 
-// marshalFrame authenticates the header and payload, then adds COBS framing.
+// Frame layout:
+//
+//	Raw frame (HMAC covers the header and payload):
+//	+-----------+--------+------------+-------------+---------------+---------------+-----------+---------------+
+//	| Version   | Kind   | ID (16)    | Symbol ID(4)| Msg len (4)   | Symbol (2)    | Payload   | HMAC-SHA256   |
+//	+-----------+--------+------------+-------------+---------------+---------------+-----------+---------------+
+//	| 1 byte    | 1      | 16 bytes   | 4 bytes     | 4 bytes       | 2 bytes       | variable  | 32 bytes      |
+//
+//	Wire frame: COBS(raw frame) + 0x00 delimiter
+//
+// marshalFrame authenticates each symbol payload and its metadata, then adds
+// COBS framing.
 func marshalFrame(f frame, key []byte) []byte {
 	raw := make([]byte, headerSize+len(f.payload)+macSize)
 	raw[0], raw[1] = protocolVersion, f.kind

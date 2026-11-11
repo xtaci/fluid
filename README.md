@@ -1,6 +1,6 @@
 # fluid
 
-A Go link layer for transparent LoRa serial modules. It uses RaptorQ to generate fragments, authenticates each fragment and acknowledgment with HMAC-SHA-256, acknowledges and retransmits fragments individually, and reassembles complete messages for the application.
+A Go link layer for transparent LoRa serial modules. It uses RaptorQ source and repair symbols, authenticates each symbol and message-completion acknowledgment with HMAC-SHA-256, and reassembles complete messages for the application.
 
 ## Usage
 
@@ -52,8 +52,8 @@ Zero values use the following defaults:
 | --- | --- | --- |
 | `MaxFrameSize` | 255 | Maximum complete encoded frame size in bytes; 64–65535 |
 | `MaxMessageSize` | 65536 | Maximum sent and received message size; empty messages are not supported |
-| `AckTimeout` | 3 seconds | Time to wait for each acknowledgment after sending |
-| `MaxRetries` | 5 | Maximum retransmissions after the initial send |
+| `AckTimeout` | 3 seconds | Time to wait for a message-completion acknowledgment after a source stream or repair batch |
+| `MaxRetries` | 5 | Maximum additional repair-symbol batches after the initial source-symbol stream |
 | `ReceiveTimeout` | 2 minutes | Retention time for an incomplete message without a valid fragment |
 | `ReplayWindow` | 10 minutes | Retention time for completed message IDs used for deduplication |
 
@@ -61,9 +61,9 @@ A message can contain at most 56403 RaptorQ source symbols; its actual size limi
 
 ## Protocol and guarantees
 
-- Frames use COBS encoding with a zero-byte delimiter. The version, type, 128-bit message ID (a random 64-bit link instance ID and 64-bit message ID), fragment index, original message length, symbol size, and fragment content are protected by HMAC. Acknowledgment frames are also authenticated independently and bound to the same message metadata and fragment index. Corrupt, unauthenticated, or invalid frames are discarded without acknowledgment. The link also ignores its own echoed data frames to avoid mistaking them for peer acknowledgments.
-- The sender transmits RaptorQ **source symbols** in order and waits for a valid acknowledgment for each before sending the next. On timeout, it retransmits the same symbol. Strict per-fragment acknowledgment means this mode does not replace lost fragments with repair symbols; RaptorQ forward error correction redundancy is not enabled.
-- The receiver authenticates and deduplicates each fragment and acknowledges the final fragment only after the complete message is reassembled and queued. A successful `Send` means the receiving link layer has reassembled and queued the message; it **does not mean the application has read or processed it**. `Receive` should be called continuously to consume messages. When the queue is full, the final fragment is not acknowledged, and the sender retries and may time out.
+- Frames use COBS encoding with a zero-byte delimiter. The version, type, 128-bit message ID (a random 64-bit link instance ID and 64-bit message ID), symbol ID, original message length, symbol size, and symbol content are protected by HMAC. The receiver verifies this HMAC before passing each source or repair symbol to RaptorQ. Acknowledgment frames are authenticated independently and bound to the message ID and metadata. Corrupt, unauthenticated, or invalid frames are discarded without acknowledgment. The link also ignores its own echoed data frames to avoid mistaking them for peer acknowledgments.
+- The sender streams all RaptorQ **source symbols** without waiting for per-symbol acknowledgments. If the message-completion acknowledgment does not arrive, it sends progressively larger batches of new **repair symbols**; it never retransmits an individual source symbol. `MaxRetries` limits these additional repair batches.
+- The receiver accepts source and repair symbols in any order, feeds them to the RaptorQ decoder, and sends a single message-completion acknowledgment only after the complete message is decoded and queued. Repeated symbols for an already completed message trigger another completion acknowledgment, allowing recovery from a lost ACK without delivering the message twice. A successful `Send` means the receiving link layer has reassembled and queued the message; it **does not mean the application has read or processed it**. `Receive` should be called continuously to consume messages. When the queue is full, the message is not acknowledged; a later repair symbol retries queueing.
 - Each endpoint can handle at most one outgoing and one incoming message at a time; concurrent `Send` calls queue locally. An incoming message canceled or abandoned by its sender occupies the receiver until `ReceiveTimeout`; other messages are not acknowledged during that time.
 - Completed message IDs are retained in memory for `ReplayWindow`, so retries with the same ID are not delivered twice. At most 128 unexpired IDs are retained; when the limit is reached, new messages are not acknowledged until an entry expires. This is not persistent replay protection: old messages may be received again after the window expires or the process restarts. A send timeout or cancellation can also occur after the peer has received the message. Applications requiring exactly-once processing across restarts must maintain persistent message IDs and deduplication themselves.
 - HMAC provides authentication between holders of the shared key and fragment integrity. It does not provide encryption, key exchange, identity separation between key holders, or application-layer integrity for the complete message. Do not share a key among mutually untrusted nodes. Applications should verify complete messages themselves and encrypt them if needed.
@@ -74,4 +74,4 @@ A message can contain at most 56403 RaptorQ source symbols; its actual size limi
 go test -race ./...
 ```
 
-The tests simulate the link using in-memory duplex streams; they do not replace serial and radio tests on the actual LoRa module.
+The tests simulate the link using in-memory duplex streams and lossy packet links; they do not replace serial and radio tests on the actual LoRa module.

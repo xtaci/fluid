@@ -29,21 +29,27 @@ import (
 	"github.com/xssnick/raptorq"
 )
 
+// incoming holds the state for the message currently being reassembled.
 type incoming struct {
-	id         [16]byte
+	// id identifies the message.
+	id [16]byte
+	// messageLen and symbolSize describe the encoded message and its symbols.
 	messageLen uint32
 	symbolSize uint16
-	next       uint32
-	total      uint32
-	decoder    *raptorq.Decoder
-	updated    time.Time
+	// decoder accumulates symbols and reconstructs the message.
+	decoder *raptorq.Decoder
+	// updated is the time the most recent symbol or retry was received.
+	updated time.Time
 }
 
+// completed stores metadata for delivered messages so late symbols can trigger
+// another completion acknowledgment without duplicate delivery.
 type completed struct {
+	// messageLen and symbolSize identify the completed message's shape.
 	messageLen uint32
 	symbolSize uint16
-	total      uint32
-	expires    time.Time
+	// expires is when this deduplication entry can be discarded.
+	expires time.Time
 }
 
 // readLoop extracts delimited frames, authenticates them, and dispatches them.
@@ -97,7 +103,7 @@ func (l *Link) readLoop() {
 }
 
 // handleData validates an authenticated symbol, updates reassembly, and
-// acknowledges it only after the symbol or completed message is accepted.
+// acknowledges only after the complete message is queued.
 func (l *Link) handleData(f frame, current **incoming, completedIDs map[[16]byte]completed) error {
 	// Ignore local echoes and expire old deduplication entries.
 	if bytes.Equal(f.id[:len(l.origin)], l.origin[:]) {
@@ -114,13 +120,13 @@ func (l *Link) handleData(f frame, current **incoming, completedIDs map[[16]byte
 		f.symbolSize == 0 || int(f.symbolSize) > l.symbolSize() || len(f.payload) != int(f.symbolSize) {
 		return nil
 	}
-	total := (uint64(f.messageLen) + uint64(f.symbolSize) - 1) / uint64(f.symbolSize)
-	if total > maxSymbols || uint64(f.index) >= total {
+	sourceSymbols := (uint64(f.messageLen) + uint64(f.symbolSize) - 1) / uint64(f.symbolSize)
+	if sourceSymbols > maxSymbols || f.index >= maxSymbols {
 		return nil
 	}
 	// Acknowledge retries for completed messages without delivering them again.
 	if entry, ok := completedIDs[f.id]; ok {
-		if entry.messageLen == f.messageLen && entry.symbolSize == f.symbolSize && f.index < entry.total {
+		if entry.messageLen == f.messageLen && entry.symbolSize == f.symbolSize {
 			return l.ack(f)
 		}
 		return nil
@@ -131,7 +137,7 @@ func (l *Link) handleData(f frame, current **incoming, completedIDs map[[16]byte
 	}
 	if *current == nil {
 		// Do not evict unexpired IDs: doing so could deliver a retry twice.
-		if f.index != 0 || len(completedIDs) >= 128 {
+		if len(completedIDs) >= 128 {
 			return nil
 		}
 		dec, err := raptorq.NewRaptorQ(uint32(f.symbolSize)).CreateDecoder(f.messageLen)
@@ -139,46 +145,40 @@ func (l *Link) handleData(f frame, current **incoming, completedIDs map[[16]byte
 			return fmt.Errorf("create RaptorQ decoder: %w", err)
 		}
 		*current = &incoming{id: f.id, messageLen: f.messageLen, symbolSize: f.symbolSize,
-			total: uint32(total), decoder: dec, updated: now}
+			decoder: dec, updated: now}
 	}
-	// Stop-and-wait accepts the next symbol or acknowledges an earlier retry.
 	s := *current
-	if s.id != f.id || s.messageLen != f.messageLen || s.symbolSize != f.symbolSize || f.index > s.next {
+	if s.id != f.id || s.messageLen != f.messageLen || s.symbolSize != f.symbolSize {
 		return nil
 	}
 	s.updated = now
-	if f.index < s.next {
-		return l.ack(f)
-	}
 	ready, err := s.decoder.AddSymbol(f.index, f.payload)
 	if err != nil {
 		return fmt.Errorf("add RaptorQ symbol: %w", err)
 	}
-	// The final acknowledgment is sent only after successful queueing.
-	if ready {
-		ok, msg, err := s.decoder.Decode()
-		if err != nil {
-			return fmt.Errorf("decode RaptorQ message: %w", err)
-		}
-		if !ok {
-			return fmt.Errorf("decode RaptorQ message: insufficient symbols")
-		}
-		select {
-		case l.messages <- msg:
-			completedIDs[f.id] = completed{f.messageLen, f.symbolSize, s.total, now.Add(l.cfg.ReplayWindow)}
-			*current = nil
-		default:
-			// Keep the final symbol unacknowledged until the application drains
-			// the queue; the sender's next retry will try delivery again.
-			return nil
-		}
-	} else {
-		s.next++
+	if !ready {
+		return nil
 	}
-	return l.ack(f)
+	ok, msg, err := s.decoder.Decode()
+	if err != nil {
+		return fmt.Errorf("decode RaptorQ message: %w", err)
+	}
+	if !ok {
+		return nil
+	}
+	select {
+	case l.messages <- msg:
+		completedIDs[f.id] = completed{f.messageLen, f.symbolSize, now.Add(l.cfg.ReplayWindow)}
+		*current = nil
+		return l.ack(f)
+	default:
+		// Leave the message unacknowledged until the application drains the
+		// queue; the sender's next repair symbol will retry delivery.
+		return nil
+	}
 }
 
-// ack sends an authenticated acknowledgment bound to the data frame metadata.
+// ack sends an authenticated message-completion acknowledgment.
 func (l *Link) ack(f frame) error {
 	f.kind = frameAck
 	f.payload = nil

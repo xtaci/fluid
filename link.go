@@ -48,11 +48,12 @@ type Config struct {
 	// MaxMessageSize limits the size of sent and received messages in bytes.
 	// Zero defaults to 65536; empty messages are not supported.
 	MaxMessageSize int
-	// AckTimeout is the time to wait for each acknowledgment after sending.
+	// AckTimeout is the time to wait for a message-completion acknowledgment
+	// after sending a source-symbol stream or a repair-symbol batch.
 	// Zero defaults to 3 seconds.
 	AckTimeout time.Duration
-	// MaxRetries is the maximum number of retransmissions after the initial
-	// send. Zero defaults to 5.
+	// MaxRetries is the maximum number of additional repair-symbol batches
+	// after the initial source-symbol stream. Zero defaults to 5.
 	MaxRetries int
 	// ReceiveTimeout is the maximum idle time before an incomplete incoming
 	// message is discarded. Zero defaults to 2 minutes.
@@ -211,8 +212,8 @@ func (l *Link) symbolSize() int {
 	return l.cfg.MaxFrameSize - headerSize - macSize - l.cfg.MaxFrameSize/254 - 2
 }
 
-// Send returns nil only when every symbol, including the final one after the
-// receiver has queued the complete message, has been acknowledged.
+// Send returns nil only after the receiver has decoded and queued the message
+// and the sender has received its message-completion acknowledgment.
 func (l *Link) Send(ctx context.Context, data []byte) error {
 	if len(data) == 0 || len(data) > l.cfg.MaxMessageSize {
 		return errors.New("message length is outside configured limits")
@@ -244,51 +245,116 @@ func (l *Link) Send(ctx context.Context, data []byte) error {
 		return fmt.Errorf("generate message ID: %w", err)
 	}
 	copy(f.id[:len(l.origin)], l.origin[:])
-	// Stop-and-wait ensures each source symbol is acknowledged in order.
-	for f.index = 0; f.index < enc.BaseSymbolsNum(); f.index++ {
+	sourceSymbols := enc.BaseSymbolsNum()
+	// Stream all source symbols without waiting for per-symbol acknowledgments.
+	for f.index = 0; f.index < sourceSymbols; f.index++ {
+		if acked, err := l.checkMessageAck(ctx, f); err != nil {
+			return err
+		} else if acked {
+			return nil
+		}
 		f.payload = enc.GenSymbol(f.index)
-		if err := l.sendSymbol(ctx, f); err != nil {
-			return fmt.Errorf("send symbol %d: %w", f.index, err)
+		if err := l.write(f); err != nil {
+			return fmt.Errorf("send source symbol %d: %w", f.index, err)
+		}
+		if acked, err := l.checkMessageAck(ctx, f); err != nil {
+			return err
+		} else if acked {
+			return nil
 		}
 	}
-	return nil
-}
 
-// sendSymbol retries a source symbol until its matching acknowledgment arrives.
-func (l *Link) sendSymbol(ctx context.Context, f frame) error {
-	for attempt := 0; attempt <= l.cfg.MaxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-l.done:
-			return l.failure()
-		default:
+	if acked, err := l.waitMessageAck(ctx, f); err != nil {
+		return err
+	} else if acked {
+		return nil
+	}
+
+	// Add repair symbols in progressively larger batches until decoding is
+	// acknowledged or the retry budget is exhausted.
+	nextRepair := sourceSymbols
+	batchSize := (sourceSymbols + 3) / 4
+	if batchSize == 0 {
+		batchSize = 1
+	}
+	for attempt := 0; attempt < l.cfg.MaxRetries && nextRepair < maxSymbols; attempt++ {
+		batchEnd := nextRepair + batchSize
+		if batchEnd < nextRepair || batchEnd > maxSymbols {
+			batchEnd = maxSymbols
 		}
-		if err := l.write(f); err != nil {
-			return err
-		}
-		// Ignore acknowledgments for other messages or symbols until timeout.
-		timer := time.NewTimer(l.cfg.AckTimeout)
-	wait:
-		for {
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-l.done:
-				timer.Stop()
-				return l.failure()
-			case ack := <-l.acks:
-				if ack.id == f.id && ack.index == f.index && ack.messageLen == f.messageLen && ack.symbolSize == f.symbolSize {
-					timer.Stop()
-					return nil
-				}
-			case <-timer.C:
-				break wait
+		for f.index = nextRepair; f.index < batchEnd; f.index++ {
+			if acked, err := l.checkMessageAck(ctx, f); err != nil {
+				return err
+			} else if acked {
+				return nil
+			}
+			f.payload = enc.GenSymbol(f.index)
+			if err := l.write(f); err != nil {
+				return fmt.Errorf("send repair symbol %d: %w", f.index, err)
+			}
+			if acked, err := l.checkMessageAck(ctx, f); err != nil {
+				return err
+			} else if acked {
+				return nil
 			}
 		}
+		nextRepair = batchEnd
+		if acked, err := l.waitMessageAck(ctx, f); err != nil {
+			return err
+		} else if acked {
+			return nil
+		}
+		if batchSize <= maxSymbols/2 {
+			batchSize *= 2
+		} else {
+			batchSize = maxSymbols
+		}
 	}
-	return errors.New("acknowledgment timeout")
+	return errors.New("message acknowledgment timeout")
+}
+
+func (l *Link) checkMessageAck(ctx context.Context, expected frame) (bool, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-l.done:
+			return false, l.failure()
+		case ack := <-l.acks:
+			if isMessageAck(ack, expected) {
+				return true, nil
+			}
+		default:
+			return false, nil
+		}
+	}
+}
+
+func (l *Link) waitMessageAck(ctx context.Context, expected frame) (bool, error) {
+	timer := time.NewTimer(l.cfg.AckTimeout)
+	defer timer.Stop()
+	for {
+		if acked, err := l.checkMessageAck(ctx, expected); acked || err != nil {
+			return acked, err
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-l.done:
+			return false, l.failure()
+		case ack := <-l.acks:
+			if isMessageAck(ack, expected) {
+				return true, nil
+			}
+		case <-timer.C:
+			return false, nil
+		}
+	}
+}
+
+func isMessageAck(ack, expected frame) bool {
+	return ack.id == expected.id && ack.messageLen == expected.messageLen &&
+		ack.symbolSize == expected.symbolSize
 }
 
 // Receive waits for the next completely reassembled message.
