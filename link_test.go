@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/raptorq"
 	"github.com/xtaci/lossyconn"
 )
 
@@ -575,6 +576,9 @@ func TestFrameEncoding(t *testing.T) {
 	if _, err := cobsDecode([]byte{3, 1}); err == nil {
 		t.Fatal("invalid COBS accepted")
 	}
+	if _, err := cobsDecode(nil); err == nil {
+		t.Fatal("empty COBS input accepted")
+	}
 	f := frame{kind: frameData, messageLen: 3, symbolSize: 3, payload: []byte("abc")}
 	p := marshalFrame(f, testKey)
 	if _, err := parseFrame(p[:len(p)-1], bytes.Repeat([]byte{1}, 32)); err == nil {
@@ -619,5 +623,66 @@ func TestConfigAndFrameLimit(t *testing.T) {
 		if n := len(marshalFrame(f, testKey)); n > max {
 			t.Fatalf("frame size %d exceeds %d", n, max)
 		}
+	}
+}
+
+func TestLinkProtectsConfigKey(t *testing.T) {
+	keyBytes := bytes.Repeat([]byte{0x73}, 32)
+	cfg := testConfig()
+	cfg.Key = keyBytes
+	left, right := net.Pipe()
+	link, err := New(left, cfg)
+	if err != nil {
+		_ = left.Close()
+		_ = right.Close()
+		t.Fatal(err)
+	}
+	defer right.Close()
+
+	if link.cfg.Key != nil {
+		t.Fatal("Link retained the key in ordinary Config memory")
+	}
+	if link.key == nil || !link.key.IsAlive() || !bytes.Equal(link.key.Bytes(), keyBytes) {
+		t.Fatal("Link did not retain the key in protected memory")
+	}
+	if !bytes.Equal(keyBytes, bytes.Repeat([]byte{0x73}, 32)) {
+		t.Fatal("New modified the caller's key slice")
+	}
+	if err := link.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if link.key.IsAlive() {
+		t.Fatal("Link did not destroy the protected key on close")
+	}
+}
+
+func TestRaptorQSymbolIDRange(t *testing.T) {
+	if !validSymbolID(maxSourceSymbols - 1) {
+		t.Fatal("last source symbol ID rejected")
+	}
+	if !validSymbolID(maxSourceSymbols) {
+		t.Fatal("first repair symbol ID rejected")
+	}
+	if !validSymbolID(maxSymbolID) {
+		t.Fatal("last 24-bit encoding symbol ID rejected")
+	}
+	if validSymbolID(maxSymbolID + 1) {
+		t.Fatal("encoding symbol ID beyond 24-bit ESI range accepted")
+	}
+
+	enc, err := raptorq.NewRaptorQ(8).CreateEncoder([]byte("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	symbol := enc.GenSymbol(maxSymbolID)
+	if len(symbol) != 8 {
+		t.Fatalf("maximum repair symbol size = %d, want 8", len(symbol))
+	}
+	dec, err := raptorq.NewRaptorQ(8).CreateDecoder(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dec.AddSymbol(maxSymbolID, symbol); err != nil {
+		t.Fatalf("decoder rejected maximum repair symbol ID: %v", err)
 	}
 }

@@ -73,7 +73,7 @@ func (l *Link) readLoop() {
 			}
 			// Only authenticated frames can affect acknowledgment or receive state.
 			if !overflow && len(packet) > 0 {
-				f, parseErr := parseFrame(packet, l.cfg.Key)
+				f, parseErr := l.parse(packet)
 				if parseErr == nil {
 					if f.kind == frameAck && len(f.payload) == 0 {
 						select {
@@ -121,7 +121,7 @@ func (l *Link) handleData(f frame, current **incoming, completedIDs map[[16]byte
 		return nil
 	}
 	sourceSymbols := (uint64(f.messageLen) + uint64(f.symbolSize) - 1) / uint64(f.symbolSize)
-	if sourceSymbols > maxSymbols || f.index >= maxSymbols {
+	if sourceSymbols > maxSourceSymbols || !validSymbolID(f.index) {
 		return nil
 	}
 	// Acknowledge retries for completed messages without delivering them again.

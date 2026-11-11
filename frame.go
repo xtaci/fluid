@@ -124,6 +124,9 @@ func cobsEncode(src []byte) []byte {
 
 // cobsDecode reverses COBS encoding and rejects truncated or invalid runs.
 func cobsDecode(src []byte) ([]byte, error) {
+	if len(src) == 0 {
+		return nil, errors.New("invalid COBS")
+	}
 	out := make([]byte, 0, len(src))
 	for i := 0; i < len(src); {
 		code := int(src[i])

@@ -31,16 +31,26 @@ import (
 	"sync"
 	"time"
 
+	"github.com/awnumar/memguard"
 	"github.com/xssnick/raptorq"
 	"go.bug.st/serial"
 )
 
-const maxSymbols = 56403
+const (
+	maxSourceSymbols = 56403
+	maxSymbolID      = 1<<24 - 1
+	maxSymbolIDLimit = maxSymbolID + 1
+)
+
+func validSymbolID(id uint32) bool {
+	return id <= maxSymbolID
+}
 
 // Config must use the same Key at both endpoints. MaxFrameSize includes COBS
 // framing and its delimiter; it must fit the radio module's maximum payload.
 type Config struct {
-	// Key is the shared HMAC key; it must contain at least 32 bytes.
+	// Key is the shared HMAC key; it must contain at least 32 bytes. New copies
+	// it into protected memory; the caller remains responsible for its slice.
 	Key []byte
 	// MaxFrameSize is the maximum encoded frame size in bytes, including the
 	// COBS delimiter. It must be between 64 and 65535; zero defaults to 255.
@@ -63,12 +73,11 @@ type Config struct {
 	ReplayWindow time.Duration
 }
 
-// normalized copies the key, applies defaults, and validates resource limits.
+// normalized applies defaults and validates resource limits.
 func (c Config) normalized() (Config, error) {
 	if len(c.Key) < 32 {
 		return c, errors.New("key must contain at least 32 bytes")
 	}
-	c.Key = append([]byte(nil), c.Key...)
 	if c.MaxFrameSize == 0 {
 		c.MaxFrameSize = 255
 	}
@@ -100,9 +109,11 @@ func (c Config) normalized() (Config, error) {
 type Link struct {
 	stream   io.ReadWriteCloser
 	cfg      Config
+	key      *memguard.LockedBuffer
 	origin   [8]byte
 	sendMu   chan struct{}
 	writeMu  sync.Mutex
+	keyMu    sync.RWMutex
 	mu       sync.Mutex
 	err      error
 	acks     chan frame
@@ -142,9 +153,17 @@ func New(stream io.ReadWriteCloser, cfg Config) (*Link, error) {
 	if err != nil {
 		return nil, err
 	}
+	key := memguard.NewBuffer(len(cfg.Key))
+	if key.Size() != len(cfg.Key) {
+		return nil, errors.New("allocate protected key memory")
+	}
+	copy(key.Bytes(), cfg.Key)
+	key.Freeze()
+	cfg.Key = nil
 	l := &Link{stream: stream, cfg: cfg, sendMu: make(chan struct{}, 1),
-		acks: make(chan frame, 1), messages: make(chan []byte, 1), done: make(chan struct{})}
+		key: key, acks: make(chan frame, 1), messages: make(chan []byte, 1), done: make(chan struct{})}
 	if _, err := rand.Read(l.origin[:]); err != nil {
+		key.Destroy()
 		return nil, fmt.Errorf("generate link origin: %w", err)
 	}
 	l.sendMu <- struct{}{}
@@ -173,6 +192,11 @@ func (l *Link) fail(err error) {
 			l.err = errors.Join(l.err, fmt.Errorf("close stream: %w", closeErr))
 			l.mu.Unlock()
 		}
+		l.keyMu.Lock()
+		if l.key != nil && l.key.IsAlive() {
+			l.key.Destroy()
+		}
+		l.keyMu.Unlock()
 	})
 }
 
@@ -185,7 +209,24 @@ func (l *Link) failure() error {
 
 // write serializes a frame and writes it without interleaving other frames.
 func (l *Link) write(f frame) error {
-	packet := marshalFrame(f, l.cfg.Key)
+	select {
+	case <-l.done:
+		return l.failure()
+	default:
+	}
+	l.keyMu.RLock()
+	select {
+	case <-l.done:
+		l.keyMu.RUnlock()
+		return l.failure()
+	default:
+	}
+	if l.key == nil || !l.key.IsAlive() {
+		l.keyMu.RUnlock()
+		return errors.New("protected key is unavailable")
+	}
+	packet := marshalFrame(f, l.key.Bytes())
+	l.keyMu.RUnlock()
 	if len(packet) > l.cfg.MaxFrameSize {
 		return errors.New("encoded frame exceeds maximum frame size")
 	}
@@ -206,6 +247,15 @@ func (l *Link) write(f frame) error {
 	return nil
 }
 
+func (l *Link) parse(encoded []byte) (frame, error) {
+	l.keyMu.RLock()
+	defer l.keyMu.RUnlock()
+	if l.key == nil || !l.key.IsAlive() {
+		return frame{}, errors.New("protected key is unavailable")
+	}
+	return parseFrame(encoded, l.key.Bytes())
+}
+
 // symbolSize returns a payload size that fits the configured frame limit.
 func (l *Link) symbolSize() int {
 	// Reserve the worst-case COBS overhead, including the zero delimiter.
@@ -219,7 +269,7 @@ func (l *Link) Send(ctx context.Context, data []byte) error {
 		return errors.New("message length is outside configured limits")
 	}
 	size := l.symbolSize()
-	if (len(data)+size-1)/size > maxSymbols {
+	if (len(data)+size-1)/size > maxSourceSymbols {
 		return errors.New("message requires too many RaptorQ symbols")
 	}
 	// Serialize messages while allowing cancellation before the lock is acquired.
@@ -277,10 +327,10 @@ func (l *Link) Send(ctx context.Context, data []byte) error {
 	if batchSize == 0 {
 		batchSize = 1
 	}
-	for attempt := 0; attempt < l.cfg.MaxRetries && nextRepair < maxSymbols; attempt++ {
+	for attempt := 0; attempt < l.cfg.MaxRetries && nextRepair < maxSymbolIDLimit; attempt++ {
 		batchEnd := nextRepair + batchSize
-		if batchEnd < nextRepair || batchEnd > maxSymbols {
-			batchEnd = maxSymbols
+		if batchEnd < nextRepair || batchEnd > maxSymbolIDLimit {
+			batchEnd = maxSymbolIDLimit
 		}
 		for f.index = nextRepair; f.index < batchEnd; f.index++ {
 			if acked, err := l.checkMessageAck(ctx, f); err != nil {
@@ -304,10 +354,10 @@ func (l *Link) Send(ctx context.Context, data []byte) error {
 		} else if acked {
 			return nil
 		}
-		if batchSize <= maxSymbols/2 {
+		if batchSize <= maxSymbolIDLimit/2 {
 			batchSize *= 2
 		} else {
-			batchSize = maxSymbols
+			batchSize = maxSymbolIDLimit
 		}
 	}
 	return errors.New("message acknowledgment timeout")

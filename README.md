@@ -38,7 +38,7 @@ func main() {
 }
 ```
 
-The receiving endpoint opens its own serial port in the same way and calls `message, err := link.Receive(ctx)`. Alternatively, use `New(stream, config)` with any transparent bidirectional stream implementing `io.ReadWriteCloser`. The link owns the stream, and its `Close` method must unblock pending reads and writes.
+The receiving endpoint opens its own serial port in the same way and calls `message, err := link.Receive(ctx)`. Alternatively, use `New(stream, config)` with any transparent bidirectional stream implementing `io.ReadWriteCloser`. The link owns the stream, and its `Close` method must unblock pending reads and writes. `New` copies `Config.Key` into memguard-protected memory and destroys that copy when the link closes; the caller's original key slice is not modified and remains the caller's responsibility.
 
 The context passed to `Send` can cancel waiting for the send lock and acknowledgments, but cannot interrupt a blocked underlying `Write`; close the link to interrupt it. Even when `Send` returns an error, the peer may already have received the message. Messages already queued can still be read with `Receive` after the link closes.
 
@@ -57,7 +57,7 @@ Zero values use the following defaults:
 | `ReceiveTimeout` | 2 minutes | Retention time for an incomplete message without a valid fragment |
 | `ReplayWindow` | 10 minutes | Retention time for completed message IDs used for deduplication |
 
-A message can contain at most 56403 RaptorQ source symbols; its actual size limit also depends on `MaxMessageSize` and the fragment size. Larger messages require more encoding computation, memory, and transmission time. The acknowledgment timeout should exceed the time needed to transmit a complete frame over the air and switch the device's direction. The receive timeout and replay window should also cover the longest retry interval.
+A message can contain at most 56403 RaptorQ source symbols; repair symbols use 24-bit encoding symbol IDs. Its actual size limit also depends on `MaxMessageSize` and the fragment size. Larger messages require more encoding computation, memory, and transmission time. The acknowledgment timeout should exceed the time needed to transmit a complete frame over the air and switch the device's direction. The receive timeout and replay window should also cover the longest retry interval.
 
 ## Protocol and guarantees
 
