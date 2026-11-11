@@ -22,6 +22,7 @@ package fluid
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -33,11 +34,21 @@ import (
 type incoming struct {
 	// id identifies the message.
 	id [16]byte
-	// messageLen and symbolSize describe the encoded message and its symbols.
+	// messageLen and chunkCount describe the complete application message.
 	messageLen uint32
+	chunkCount uint32
+	// nextChunk is the next RaptorQ generation expected from the sender.
+	nextChunk uint32
+	// assembled contains all decoded chunks in order.
+	assembled []byte
+	// chunkLen and decoder describe the active RaptorQ generation.
+	chunkLen uint32
+	decoder  *raptorq.Decoder
+	// deliveryReady means the final chunk is decoded but the application queue
+	// was full when delivery was attempted.
+	deliveryReady bool
+	// symbolSize is the symbol size shared by this message's generations.
 	symbolSize uint16
-	// decoder accumulates symbols and reconstructs the message.
-	decoder *raptorq.Decoder
 	// updated is the time the most recent symbol or retry was received.
 	updated time.Time
 }
@@ -47,24 +58,26 @@ type incoming struct {
 type completed struct {
 	// messageLen and symbolSize identify the completed message's shape.
 	messageLen uint32
+	chunkCount uint32
 	symbolSize uint16
 	// expires is when this deduplication entry can be discarded.
 	expires time.Time
 }
 
 // readLoop extracts delimited frames, authenticates them, and dispatches them.
+// Oversized frames are discarded through the next delimiter for resynchronization.
 func (l *Link) readLoop() {
 	var active *incoming
 	completedIDs := make(map[[16]byte]completed)
 	buf := make([]byte, 1024)
-	packet := make([]byte, 0, l.cfg.MaxFrameSize)
+	packet := make([]byte, 0, l.cfg.MaxWireFrameBytes)
 	overflow := false
 	for {
 		n, err := l.stream.Read(buf)
 		// Discard an oversized packet until the next delimiter to resynchronize.
 		for _, b := range buf[:n] {
 			if b != 0 {
-				if len(packet) >= l.cfg.MaxFrameSize-1 {
+				if len(packet) >= l.cfg.MaxWireFrameBytes-1 {
 					overflow = true
 				} else if !overflow {
 					packet = append(packet, b)
@@ -75,7 +88,7 @@ func (l *Link) readLoop() {
 			if !overflow && len(packet) > 0 {
 				f, parseErr := l.parse(packet)
 				if parseErr == nil {
-					if f.kind == frameAck && len(f.payload) == 0 {
+					if (f.kind == frameAck || f.kind == frameChunkAck) && len(f.payload) == 0 {
 						select {
 						case l.acks <- f:
 						default:
@@ -102,8 +115,8 @@ func (l *Link) readLoop() {
 	}
 }
 
-// handleData validates an authenticated symbol, updates reassembly, and
-// acknowledges only after the complete message is queued.
+// handleData validates an authenticated symbol, decodes its generation, and
+// acknowledges the generation or the complete message after queueing.
 func (l *Link) handleData(f frame, current **incoming, completedIDs map[[16]byte]completed) error {
 	// Ignore local echoes and expire old deduplication entries.
 	if bytes.Equal(f.id[:len(l.origin)], l.origin[:]) {
@@ -116,18 +129,33 @@ func (l *Link) handleData(f frame, current **incoming, completedIDs map[[16]byte
 		}
 	}
 	// Validate all size and index fields before allocating a decoder.
-	if f.messageLen == 0 || uint64(f.messageLen) > uint64(l.cfg.MaxMessageSize) ||
+	if f.messageLen == 0 || uint64(f.messageLen) > uint64(l.cfg.MaxAppMessageBytes) ||
 		f.symbolSize == 0 || int(f.symbolSize) > l.symbolSize() || len(f.payload) != int(f.symbolSize) {
 		return nil
 	}
-	sourceSymbols := (uint64(f.messageLen) + uint64(f.symbolSize) - 1) / uint64(f.symbolSize)
+	chunkCapacity := uint64(l.chunkCapacity(f.symbolSize))
+	expectedChunks := (uint64(f.messageLen) + chunkCapacity - 1) / chunkCapacity
+	chunkStart := uint64(f.chunkIndex) * chunkCapacity
+	if f.chunkCount == 0 || uint64(f.chunkCount) != expectedChunks ||
+		f.chunkIndex >= f.chunkCount || chunkStart >= uint64(f.messageLen) {
+		return nil
+	}
+	expectedChunkLen := chunkCapacity
+	if remaining := uint64(f.messageLen) - chunkStart; expectedChunkLen > remaining {
+		expectedChunkLen = remaining
+	}
+	if uint64(f.chunkLen) != expectedChunkLen {
+		return nil
+	}
+	sourceSymbols := (uint64(f.chunkLen) + uint64(f.symbolSize) - 1) / uint64(f.symbolSize)
 	if sourceSymbols > maxSourceSymbols || !validSymbolID(f.index) {
 		return nil
 	}
 	// Acknowledge retries for completed messages without delivering them again.
 	if entry, ok := completedIDs[f.id]; ok {
-		if entry.messageLen == f.messageLen && entry.symbolSize == f.symbolSize {
-			return l.ack(f)
+		if entry.messageLen == f.messageLen && entry.chunkCount == f.chunkCount &&
+			entry.symbolSize == f.symbolSize {
+			return l.ack(f, frameAck)
 		}
 		return nil
 	}
@@ -140,18 +168,39 @@ func (l *Link) handleData(f frame, current **incoming, completedIDs map[[16]byte
 		if len(completedIDs) >= 128 {
 			return nil
 		}
-		dec, err := raptorq.NewRaptorQ(uint32(f.symbolSize)).CreateDecoder(f.messageLen)
-		if err != nil {
-			return fmt.Errorf("create RaptorQ decoder: %w", err)
-		}
-		*current = &incoming{id: f.id, messageLen: f.messageLen, symbolSize: f.symbolSize,
-			decoder: dec, updated: now}
+		*current = &incoming{id: f.id, messageLen: f.messageLen, chunkCount: f.chunkCount,
+			symbolSize: f.symbolSize, updated: now}
 	}
 	s := *current
-	if s.id != f.id || s.messageLen != f.messageLen || s.symbolSize != f.symbolSize {
+	if s.id != f.id || s.messageLen != f.messageLen || s.chunkCount != f.chunkCount ||
+		s.symbolSize != f.symbolSize {
 		return nil
 	}
 	s.updated = now
+	// Completed chunks may be retransmitted when their chunk ACK was lost.
+	if f.chunkIndex < s.nextChunk {
+		if s.deliveryReady && f.chunkIndex+1 == s.chunkCount {
+			return l.deliverIncoming(s, current, completedIDs, f, now)
+		}
+		return l.ack(f, frameChunkAck)
+	}
+	if f.chunkIndex != s.nextChunk {
+		return nil
+	}
+	if s.deliveryReady {
+		return l.deliverIncoming(s, current, completedIDs, f, now)
+	}
+	if s.decoder == nil {
+		dec, err := raptorq.NewRaptorQ(uint32(f.symbolSize)).CreateDecoder(f.chunkLen)
+		if err != nil {
+			return fmt.Errorf("create RaptorQ decoder: %w", err)
+		}
+		s.chunkLen = f.chunkLen
+		s.decoder = dec
+	}
+	if s.chunkLen != f.chunkLen {
+		return nil
+	}
 	ready, err := s.decoder.AddSymbol(f.index, f.payload)
 	if err != nil {
 		return fmt.Errorf("add RaptorQ symbol: %w", err)
@@ -166,21 +215,38 @@ func (l *Link) handleData(f frame, current **incoming, completedIDs map[[16]byte
 	if !ok {
 		return nil
 	}
+	if uint64(len(msg)) != uint64(s.chunkLen) {
+		return errors.New("RaptorQ decoded unexpected chunk length")
+	}
+	s.assembled = append(s.assembled, msg...)
+	s.nextChunk++
+	s.decoder = nil
+	s.chunkLen = 0
+	if s.nextChunk < s.chunkCount {
+		return l.ack(f, frameChunkAck)
+	}
+	if uint64(len(s.assembled)) != uint64(s.messageLen) {
+		return errors.New("reassembled message length mismatch")
+	}
+	s.deliveryReady = true
+	return l.deliverIncoming(s, current, completedIDs, f, now)
+}
+
+// deliverIncoming queues a fully reassembled message and sends its final ACK.
+func (l *Link) deliverIncoming(s *incoming, current **incoming, completedIDs map[[16]byte]completed, f frame, now time.Time) error {
 	select {
-	case l.messages <- msg:
-		completedIDs[f.id] = completed{f.messageLen, f.symbolSize, now.Add(l.cfg.ReplayWindow)}
+	case l.messages <- s.assembled:
+		completedIDs[s.id] = completed{s.messageLen, s.chunkCount, s.symbolSize, now.Add(l.cfg.ReplayWindow)}
 		*current = nil
-		return l.ack(f)
+		return l.ack(f, frameAck)
 	default:
-		// Leave the message unacknowledged until the application drains the
-		// queue; the sender's next repair symbol will retry delivery.
 		return nil
 	}
 }
 
-// ack sends an authenticated message-completion acknowledgment.
-func (l *Link) ack(f frame) error {
-	f.kind = frameAck
+// ack sends an authenticated chunk or message-completion acknowledgment.
+func (l *Link) ack(f frame, kind byte) error {
+	f.kind = kind
 	f.payload = nil
 	return l.write(f)
 }

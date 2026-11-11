@@ -31,7 +31,8 @@ const (
 	protocolVersion = 1
 	frameData       = 1
 	frameAck        = 2
-	headerSize      = 28          // 1 version + 1 kind + 16 ID + 4 index + 4 message length + 2 symbol size
+	frameChunkAck   = 3
+	headerSize      = 40          // version + kind + ID + symbol ID + message/chunk metadata + symbol size
 	macSize         = sha256.Size // HMAC-SHA256 length in bytes
 )
 
@@ -39,7 +40,10 @@ type frame struct {
 	kind       byte
 	id         [16]byte
 	index      uint32 // RaptorQ source or repair symbol ID.
-	messageLen uint32
+	messageLen uint32 // Complete application message length.
+	chunkLen   uint32 // Length decoded by this RaptorQ generation.
+	chunkIndex uint32
+	chunkCount uint32
 	symbolSize uint16
 	payload    []byte
 }
@@ -47,10 +51,10 @@ type frame struct {
 // Frame layout:
 //
 //	Raw frame (HMAC covers the header and payload):
-//	+-----------+--------+------------+-------------+---------------+---------------+-----------+---------------+
-//	| Version   | Kind   | ID (16)    | Symbol ID(4)| Msg len (4)   | Symbol (2)    | Payload   | HMAC-SHA256   |
-//	+-----------+--------+------------+-------------+---------------+---------------+-----------+---------------+
-//	| 1 byte    | 1      | 16 bytes   | 4 bytes     | 4 bytes       | 2 bytes       | variable  | 32 bytes      |
+//	+-----------+--------+------------+-------------+---------------+---------------+---------------+---------------+---------------+-----------+---------------+
+//	| Version   | Kind   | ID (16)    | Symbol ID(4)| Message len(4)| Chunk len(4) | Chunk index(4)| Chunk count(4)| Symbol (2)    | Payload   | HMAC-SHA256   |
+//	+-----------+--------+------------+-------------+---------------+---------------+---------------+---------------+---------------+-----------+---------------+
+//	| 1 byte    | 1      | 16 bytes   | 4 bytes     | 4 bytes       | 4 bytes       | 4 bytes       | 4 bytes       | 2 bytes       | variable  | 32 bytes      |
 //
 //	Wire frame: COBS(raw frame) + 0x00 delimiter
 //
@@ -62,7 +66,10 @@ func marshalFrame(f frame, key []byte) []byte {
 	copy(raw[2:18], f.id[:])
 	binary.BigEndian.PutUint32(raw[18:22], f.index)
 	binary.BigEndian.PutUint32(raw[22:26], f.messageLen)
-	binary.BigEndian.PutUint16(raw[26:28], f.symbolSize)
+	binary.BigEndian.PutUint32(raw[26:30], f.chunkLen)
+	binary.BigEndian.PutUint32(raw[30:34], f.chunkIndex)
+	binary.BigEndian.PutUint32(raw[34:38], f.chunkCount)
+	binary.BigEndian.PutUint16(raw[38:40], f.symbolSize)
 	copy(raw[headerSize:], f.payload)
 	mac := hmac.New(sha256.New, key)
 	mac.Write(raw[:len(raw)-macSize])
@@ -81,14 +88,17 @@ func parseFrame(encoded, key []byte) (frame, error) {
 	if !hmac.Equal(raw[len(raw)-macSize:], mac.Sum(nil)) {
 		return frame{}, errors.New("invalid frame HMAC")
 	}
-	if raw[0] != protocolVersion || (raw[1] != frameData && raw[1] != frameAck) {
+	if raw[0] != protocolVersion || (raw[1] != frameData && raw[1] != frameAck && raw[1] != frameChunkAck) {
 		return frame{}, errors.New("unsupported frame")
 	}
 	f := frame{
 		kind:       raw[1],
 		index:      binary.BigEndian.Uint32(raw[18:22]),
 		messageLen: binary.BigEndian.Uint32(raw[22:26]),
-		symbolSize: binary.BigEndian.Uint16(raw[26:28]),
+		chunkLen:   binary.BigEndian.Uint32(raw[26:30]),
+		chunkIndex: binary.BigEndian.Uint32(raw[30:34]),
+		chunkCount: binary.BigEndian.Uint32(raw[34:38]),
+		symbolSize: binary.BigEndian.Uint16(raw[38:40]),
 		payload:    raw[headerSize : len(raw)-macSize],
 	}
 	copy(f.id[:], raw[2:18])

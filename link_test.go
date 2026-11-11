@@ -38,8 +38,22 @@ var testKey = bytes.Repeat([]byte{0x42}, 32)
 
 // testConfig provides short retry timings and a shared test key.
 func testConfig() Config {
-	return Config{Key: testKey, MaxFrameSize: 96, AckTimeout: 20 * time.Millisecond,
+	return Config{Key: testKey, MaxWireFrameBytes: 96, AckTimeout: 20 * time.Millisecond,
 		MaxRetries: 10, ReceiveTimeout: time.Second, ReplayWindow: time.Minute}
+}
+
+func TestDefaultConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.MaxWireFrameBytes != 255 || cfg.MaxAppMessageBytes != 1<<20 ||
+		cfg.MaxChunkBytes != 32<<10 ||
+		cfg.AckTimeout != 3*time.Second || cfg.MaxRetries != 5 ||
+		cfg.ReceiveTimeout != 2*time.Minute || cfg.ReplayWindow != 10*time.Minute {
+		t.Fatalf("unexpected default config: %+v", cfg)
+	}
+	cfg.Key = testKey
+	if _, err := cfg.normalized(); err != nil {
+		t.Fatalf("default config is invalid: %v", err)
+	}
 }
 
 type filterStream struct {
@@ -55,9 +69,14 @@ type lossyPacketStream struct {
 }
 
 type raptorqMessageStats struct {
-	seen    map[uint32]struct{}
+	seen    map[raptorqSymbolID]struct{}
 	symbols uint64
 	bytes   uint64
+}
+
+type raptorqSymbolID struct {
+	chunk uint32
+	index uint32
 }
 
 type raptorqInputStats struct {
@@ -78,13 +97,14 @@ func (s *raptorqInputStats) record(packet []byte) {
 	}
 	stats := s.messages[f.id]
 	if stats == nil {
-		stats = &raptorqMessageStats{seen: make(map[uint32]struct{})}
+		stats = &raptorqMessageStats{seen: make(map[raptorqSymbolID]struct{})}
 		s.messages[f.id] = stats
 	}
-	if _, ok := stats.seen[f.index]; ok {
+	symbolID := raptorqSymbolID{chunk: f.chunkIndex, index: f.index}
+	if _, ok := stats.seen[symbolID]; ok {
 		return
 	}
-	stats.seen[f.index] = struct{}{}
+	stats.seen[symbolID] = struct{}{}
 	stats.symbols++
 	stats.bytes += uint64(len(f.payload))
 }
@@ -422,6 +442,80 @@ func TestLargeMessage(t *testing.T) {
 	}
 }
 
+// TestSendReceiveAutomaticChunking verifies independent RaptorQ chunks and
+// confirms that only final reassembly produces the message-completion ACK.
+func TestSendReceiveAutomaticChunking(t *testing.T) {
+	var mu sync.Mutex
+	seenChunks := make(map[uint32]map[uint32]struct{})
+	chunkAcks, finalAcks := 0, 0
+	droppedChunkAck, droppedFinalAck := false, false
+	left, right := pair(t, func(p []byte) []byte {
+		f := frameFromPacket(t, p)
+		if f.kind == frameData {
+			mu.Lock()
+			if seenChunks[f.chunkIndex] == nil {
+				seenChunks[f.chunkIndex] = make(map[uint32]struct{})
+			}
+			seenChunks[f.chunkIndex][f.index] = struct{}{}
+			mu.Unlock()
+		}
+		return p
+	}, func(p []byte) []byte {
+		f := frameFromPacket(t, p)
+		mu.Lock()
+		defer mu.Unlock()
+		switch f.kind {
+		case frameChunkAck:
+			chunkAcks++
+			if !droppedChunkAck {
+				droppedChunkAck = true
+				return nil
+			}
+		case frameAck:
+			finalAcks++
+			if !droppedFinalAck {
+				droppedFinalAck = true
+				return nil
+			}
+		}
+		return p
+	})
+	msg := make([]byte, 70<<10)
+	for i := range msg {
+		msg[i] = byte(i*31 + i/7)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := left.Send(ctx, msg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := right.Receive(ctx)
+	if err != nil || !bytes.Equal(got, msg) {
+		t.Fatalf("Receive = %d bytes, %v", len(got), err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenChunks) != 3 {
+		t.Fatalf("sent %d chunks, want 3", len(seenChunks))
+	}
+	for chunk := uint32(0); chunk < 3; chunk++ {
+		if _, ok := seenChunks[chunk][0]; !ok {
+			t.Errorf("chunk %d did not start an independent RaptorQ generation: %v", chunk, seenChunks[chunk])
+		}
+	}
+	if chunkAcks < 3 {
+		t.Fatalf("got %d chunk ACKs, want retry after dropping the first", chunkAcks)
+	}
+	if finalAcks < 2 {
+		t.Fatalf("got %d final message ACKs, want a retry after dropping the first", finalAcks)
+	}
+	short, stop := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer stop()
+	if _, err := right.Receive(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("duplicate message after lost final ACK: %v", err)
+	}
+}
+
 // TestLossyTransportMessageSizes exercises retransmission and reassembly across
 // a matrix of bidirectional packet-loss rates and reports simulator statistics.
 func TestLossyTransportMessageSizes(t *testing.T) {
@@ -456,14 +550,14 @@ func testLossyMessageSizes(t *testing.T, lossRate, corruptionRate float64, seed 
 	linkCfg := testConfig()
 	// Each encoded frame is one lossyconn datagram, so the protocol's frame
 	// limit must not exceed the simulated link's packet-size limit.
-	linkCfg.MaxFrameSize = lossCfg.MaxPacketSize
+	linkCfg.MaxWireFrameBytes = lossCfg.MaxPacketSize
 	linkCfg.AckTimeout = 20 * time.Millisecond
 	linkCfg.MaxRetries = 100
 	inputStats := &raptorqInputStats{}
 	left, right, leftConn, rightConn := lossyPair(t, lossCfg, linkCfg, inputStats)
 	symbolSize := left.symbolSize()
 	if symbolSize <= 0 {
-		t.Fatalf("invalid symbol size %d for max frame size %d", symbolSize, linkCfg.MaxFrameSize)
+		t.Fatalf("invalid symbol size %d for max frame size %d", symbolSize, linkCfg.MaxWireFrameBytes)
 	}
 	maxFrame := marshalFrame(frame{
 		kind:       frameData,
@@ -613,8 +707,8 @@ func TestConfigAndFrameLimit(t *testing.T) {
 	if _, err := (Config{}).normalized(); err == nil {
 		t.Fatal("missing key accepted")
 	}
-	for _, max := range []int{64, 96, 254, 255, 256, 512, 65535} {
-		cfg, err := (Config{Key: testKey, MaxFrameSize: max}).normalized()
+	for _, max := range []int{76, 96, 254, 255, 256, 512, 65535} {
+		cfg, err := (Config{Key: testKey, MaxWireFrameBytes: max}).normalized()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -623,6 +717,9 @@ func TestConfigAndFrameLimit(t *testing.T) {
 		if n := len(marshalFrame(f, testKey)); n > max {
 			t.Fatalf("frame size %d exceeds %d", n, max)
 		}
+	}
+	if _, err := (Config{Key: testKey, MaxWireFrameBytes: 75}).normalized(); err == nil {
+		t.Fatal("wire frame limit below the minimum payload size accepted")
 	}
 }
 

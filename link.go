@@ -42,28 +42,34 @@ const (
 	maxSymbolIDLimit = maxSymbolID + 1
 )
 
+// validSymbolID reports whether id fits the RaptorQ 24-bit encoding-symbol ID.
 func validSymbolID(id uint32) bool {
 	return id <= maxSymbolID
 }
 
-// Config must use the same Key at both endpoints. MaxFrameSize includes COBS
-// framing and its delimiter; it must fit the radio module's maximum payload.
+// Config must use the same Key and compatible frame and chunk sizes at both
+// endpoints. MaxWireFrameBytes includes COBS framing and its delimiter; it must
+// fit the radio module's maximum payload.
 type Config struct {
 	// Key is the shared HMAC key; it must contain at least 32 bytes. New copies
 	// it into protected memory; the caller remains responsible for its slice.
 	Key []byte
-	// MaxFrameSize is the maximum encoded frame size in bytes, including the
-	// COBS delimiter. It must be between 64 and 65535; zero defaults to 255.
-	MaxFrameSize int
-	// MaxMessageSize limits the size of sent and received messages in bytes.
-	// Zero defaults to 65536; empty messages are not supported.
-	MaxMessageSize int
-	// AckTimeout is the time to wait for a message-completion acknowledgment
-	// after sending a source-symbol stream or a repair-symbol batch.
+	// MaxWireFrameBytes limits one complete encoded frame, including the COBS
+	// delimiter. It must be between 76 and 65535; zero defaults to 255.
+	MaxWireFrameBytes int
+	// MaxAppMessageBytes limits the complete application message size sent or
+	// received, excluding per-frame headers and framing. Zero defaults to
+	// 1 MiB; empty messages are not supported.
+	MaxAppMessageBytes int
+	// MaxChunkBytes limits the input size of each independent RaptorQ generation.
+	// Zero defaults to 32 KiB.
+	MaxChunkBytes int
+	// AckTimeout is the time to wait for a chunk or message-completion
+	// acknowledgment after sending a source-symbol stream or repair batch.
 	// Zero defaults to 3 seconds.
 	AckTimeout time.Duration
-	// MaxRetries is the maximum number of additional repair-symbol batches
-	// after the initial source-symbol stream. Zero defaults to 5.
+	// MaxRetries is the maximum number of repair-symbol batches per chunk after
+	// the initial source-symbol stream. Zero defaults to 5.
 	MaxRetries int
 	// ReceiveTimeout is the maximum idle time before an incomplete incoming
 	// message is discarded. Zero defaults to 2 minutes.
@@ -73,31 +79,52 @@ type Config struct {
 	ReplayWindow time.Duration
 }
 
-// normalized applies defaults and validates resource limits.
+// DefaultConfig returns the baseline settings for a transparent serial radio
+// link. It assumes the radio accepts wire frames up to 255 bytes; callers must
+// adjust this and the timeouts for their module and air settings. Set Key before
+// passing the config to Open or New.
+func DefaultConfig() Config {
+	return Config{
+		MaxWireFrameBytes:  255,
+		MaxAppMessageBytes: 1 << 20,
+		MaxChunkBytes:      32 << 10,
+		AckTimeout:         3 * time.Second,
+		MaxRetries:         5,
+		ReceiveTimeout:     2 * time.Minute,
+		ReplayWindow:       10 * time.Minute,
+	}
+}
+
+// normalized fills zero-valued options from DefaultConfig and validates limits.
 func (c Config) normalized() (Config, error) {
 	if len(c.Key) < 32 {
 		return c, errors.New("key must contain at least 32 bytes")
 	}
-	if c.MaxFrameSize == 0 {
-		c.MaxFrameSize = 255
+	defaults := DefaultConfig()
+	if c.MaxWireFrameBytes == 0 {
+		c.MaxWireFrameBytes = defaults.MaxWireFrameBytes
 	}
-	if c.MaxMessageSize == 0 {
-		c.MaxMessageSize = 64 << 10
+	if c.MaxAppMessageBytes == 0 {
+		c.MaxAppMessageBytes = defaults.MaxAppMessageBytes
+	}
+	if c.MaxChunkBytes == 0 {
+		c.MaxChunkBytes = defaults.MaxChunkBytes
 	}
 	if c.AckTimeout == 0 {
-		c.AckTimeout = 3 * time.Second
+		c.AckTimeout = defaults.AckTimeout
 	}
 	if c.MaxRetries == 0 {
-		c.MaxRetries = 5
+		c.MaxRetries = defaults.MaxRetries
 	}
 	if c.ReceiveTimeout == 0 {
-		c.ReceiveTimeout = 2 * time.Minute
+		c.ReceiveTimeout = defaults.ReceiveTimeout
 	}
 	if c.ReplayWindow == 0 {
-		c.ReplayWindow = 10 * time.Minute
+		c.ReplayWindow = defaults.ReplayWindow
 	}
-	if c.MaxFrameSize < 64 || c.MaxFrameSize > 65535 ||
-		c.MaxMessageSize < 1 || uint64(c.MaxMessageSize) > uint64(^uint32(0))-65535 ||
+	if c.MaxWireFrameBytes < 76 || c.MaxWireFrameBytes > 65535 ||
+		c.MaxAppMessageBytes < 1 || uint64(c.MaxAppMessageBytes) > uint64(^uint32(0))-65535 ||
+		c.MaxChunkBytes < 1 || uint64(c.MaxChunkBytes) > uint64(^uint32(0)) ||
 		c.AckTimeout < 0 || c.MaxRetries < 0 || c.ReceiveTimeout < 0 || c.ReplayWindow < 0 {
 		return c, errors.New("invalid link configuration")
 	}
@@ -123,6 +150,7 @@ type Link struct {
 }
 
 // Open opens a transparent serial port using 8N1 and the supplied baud rate.
+// The returned Link owns the port and closes it when Link.Close is called.
 func Open(port string, baudRate int, cfg Config) (*Link, error) {
 	if port == "" || baudRate <= 0 {
 		return nil, errors.New("invalid serial port or baud rate")
@@ -145,6 +173,7 @@ func Open(port string, baudRate int, cfg Config) (*Link, error) {
 }
 
 // New starts a link over a transparent byte stream and takes ownership of it.
+// The stream's Close method must unblock pending reads and writes.
 func New(stream io.ReadWriteCloser, cfg Config) (*Link, error) {
 	if stream == nil {
 		return nil, errors.New("nil stream")
@@ -227,7 +256,7 @@ func (l *Link) write(f frame) error {
 	}
 	packet := marshalFrame(f, l.key.Bytes())
 	l.keyMu.RUnlock()
-	if len(packet) > l.cfg.MaxFrameSize {
+	if len(packet) > l.cfg.MaxWireFrameBytes {
 		return errors.New("encoded frame exceeds maximum frame size")
 	}
 	l.writeMu.Lock()
@@ -247,6 +276,7 @@ func (l *Link) write(f frame) error {
 	return nil
 }
 
+// parse decodes and authenticates a wire frame with the link's protected key.
 func (l *Link) parse(encoded []byte) (frame, error) {
 	l.keyMu.RLock()
 	defer l.keyMu.RUnlock()
@@ -256,22 +286,21 @@ func (l *Link) parse(encoded []byte) (frame, error) {
 	return parseFrame(encoded, l.key.Bytes())
 }
 
-// symbolSize returns a payload size that fits the configured frame limit.
+// symbolSize returns the largest symbol payload that fits in one configured
+// wire frame after headers, authentication, COBS encoding, and delimiter.
 func (l *Link) symbolSize() int {
 	// Reserve the worst-case COBS overhead, including the zero delimiter.
-	return l.cfg.MaxFrameSize - headerSize - macSize - l.cfg.MaxFrameSize/254 - 2
+	return l.cfg.MaxWireFrameBytes - headerSize - macSize - l.cfg.MaxWireFrameBytes/254 - 2
 }
 
-// Send returns nil only after the receiver has decoded and queued the message
-// and the sender has received its message-completion acknowledgment.
+// Send splits data into bounded RaptorQ generations as needed. It returns nil
+// only after the receiver has reassembled and queued the whole message and the
+// sender has received its message-completion acknowledgment.
 func (l *Link) Send(ctx context.Context, data []byte) error {
-	if len(data) == 0 || len(data) > l.cfg.MaxMessageSize {
+	if len(data) == 0 || len(data) > l.cfg.MaxAppMessageBytes {
 		return errors.New("message length is outside configured limits")
 	}
 	size := l.symbolSize()
-	if (len(data)+size-1)/size > maxSourceSymbols {
-		return errors.New("message requires too many RaptorQ symbols")
-	}
 	// Serialize messages while allowing cancellation before the lock is acquired.
 	select {
 	case <-ctx.Done():
@@ -286,38 +315,72 @@ func (l *Link) Send(ctx context.Context, data []byte) error {
 	}
 	// Use a random message suffix and a per-link origin to distinguish messages
 	// and identify data frames echoed by the local serial module.
-	enc, err := raptorq.NewRaptorQ(uint32(size)).CreateEncoder(data)
-	if err != nil {
-		return fmt.Errorf("create RaptorQ encoder: %w", err)
-	}
-	f := frame{kind: frameData, messageLen: uint32(len(data)), symbolSize: uint16(size)}
+	chunkCapacity := l.chunkCapacity(uint16(size))
+	chunkCount := uint32((uint64(len(data)) + uint64(chunkCapacity) - 1) / uint64(chunkCapacity))
+	f := frame{kind: frameData, messageLen: uint32(len(data)), chunkCount: chunkCount, symbolSize: uint16(size)}
 	if _, err := rand.Read(f.id[:]); err != nil {
 		return fmt.Errorf("generate message ID: %w", err)
 	}
 	copy(f.id[:len(l.origin)], l.origin[:])
+	for chunkIndex, start := uint32(0), 0; chunkIndex < chunkCount; chunkIndex++ {
+		end := start + int(chunkCapacity)
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := data[start:end]
+		enc, err := raptorq.NewRaptorQ(uint32(size)).CreateEncoder(chunk)
+		if err != nil {
+			return fmt.Errorf("create RaptorQ encoder for chunk %d: %w", chunkIndex, err)
+		}
+		f.chunkLen = uint32(len(chunk))
+		f.chunkIndex = chunkIndex
+		f.payload = nil
+		if done, err := l.sendChunk(ctx, f, enc); err != nil {
+			return err
+		} else if done && chunkIndex+1 == chunkCount {
+			return nil
+		}
+		start = end
+	}
+	return nil
+}
+
+// chunkCapacity bounds each RaptorQ generation by both configuration and the
+// source-symbol limit for the selected symbol size.
+func (l *Link) chunkCapacity(symbolSize uint16) uint32 {
+	capacity := uint64(l.cfg.MaxChunkBytes)
+	maxBySymbols := uint64(maxSourceSymbols) * uint64(symbolSize)
+	if capacity > maxBySymbols {
+		capacity = maxBySymbols
+	}
+	return uint32(capacity)
+}
+
+// sendChunk streams one RaptorQ generation and waits for its chunk or final ACK.
+func (l *Link) sendChunk(ctx context.Context, f frame, enc *raptorq.Encoder) (bool, error) {
 	sourceSymbols := enc.BaseSymbolsNum()
 	// Stream all source symbols without waiting for per-symbol acknowledgments.
 	for f.index = 0; f.index < sourceSymbols; f.index++ {
-		if acked, err := l.checkMessageAck(ctx, f); err != nil {
-			return err
+		if acked, err := l.checkChunkAck(ctx, f); err != nil {
+			return false, err
 		} else if acked {
-			return nil
+			return true, nil
 		}
 		f.payload = enc.GenSymbol(f.index)
 		if err := l.write(f); err != nil {
-			return fmt.Errorf("send source symbol %d: %w", f.index, err)
+			return false, fmt.Errorf("send source symbol %d of chunk %d: %w", f.index, f.chunkIndex, err)
 		}
-		if acked, err := l.checkMessageAck(ctx, f); err != nil {
-			return err
+		if acked, err := l.checkChunkAck(ctx, f); err != nil {
+			return false, err
 		} else if acked {
-			return nil
+			return true, nil
 		}
 	}
 
-	if acked, err := l.waitMessageAck(ctx, f); err != nil {
-		return err
+	if acked, err := l.waitChunkAck(ctx, f); err != nil {
+		return false, err
 	} else if acked {
-		return nil
+		return true, nil
 	}
 
 	// Add repair symbols in progressively larger batches until decoding is
@@ -333,26 +396,26 @@ func (l *Link) Send(ctx context.Context, data []byte) error {
 			batchEnd = maxSymbolIDLimit
 		}
 		for f.index = nextRepair; f.index < batchEnd; f.index++ {
-			if acked, err := l.checkMessageAck(ctx, f); err != nil {
-				return err
+			if acked, err := l.checkChunkAck(ctx, f); err != nil {
+				return false, err
 			} else if acked {
-				return nil
+				return true, nil
 			}
 			f.payload = enc.GenSymbol(f.index)
 			if err := l.write(f); err != nil {
-				return fmt.Errorf("send repair symbol %d: %w", f.index, err)
+				return false, fmt.Errorf("send repair symbol %d of chunk %d: %w", f.index, f.chunkIndex, err)
 			}
-			if acked, err := l.checkMessageAck(ctx, f); err != nil {
-				return err
+			if acked, err := l.checkChunkAck(ctx, f); err != nil {
+				return false, err
 			} else if acked {
-				return nil
+				return true, nil
 			}
 		}
 		nextRepair = batchEnd
-		if acked, err := l.waitMessageAck(ctx, f); err != nil {
-			return err
+		if acked, err := l.waitChunkAck(ctx, f); err != nil {
+			return false, err
 		} else if acked {
-			return nil
+			return true, nil
 		}
 		if batchSize <= maxSymbolIDLimit/2 {
 			batchSize *= 2
@@ -360,10 +423,19 @@ func (l *Link) Send(ctx context.Context, data []byte) error {
 			batchSize = maxSymbolIDLimit
 		}
 	}
-	return errors.New("message acknowledgment timeout")
+	return false, errors.New("message acknowledgment timeout")
 }
 
-func (l *Link) checkMessageAck(ctx context.Context, expected frame) (bool, error) {
+// expectedAckKind selects a chunk ACK or the final message-completion ACK.
+func expectedAckKind(expected frame) byte {
+	if expected.chunkIndex+1 == expected.chunkCount {
+		return frameAck
+	}
+	return frameChunkAck
+}
+
+// checkChunkAck consumes a queued ACK and matches it to the expected chunk.
+func (l *Link) checkChunkAck(ctx context.Context, expected frame) (bool, error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -371,7 +443,7 @@ func (l *Link) checkMessageAck(ctx context.Context, expected frame) (bool, error
 		case <-l.done:
 			return false, l.failure()
 		case ack := <-l.acks:
-			if isMessageAck(ack, expected) {
+			if isChunkAck(ack, expected) {
 				return true, nil
 			}
 		default:
@@ -380,11 +452,12 @@ func (l *Link) checkMessageAck(ctx context.Context, expected frame) (bool, error
 	}
 }
 
-func (l *Link) waitMessageAck(ctx context.Context, expected frame) (bool, error) {
+// waitChunkAck waits up to AckTimeout for an ACK matching the expected chunk.
+func (l *Link) waitChunkAck(ctx context.Context, expected frame) (bool, error) {
 	timer := time.NewTimer(l.cfg.AckTimeout)
 	defer timer.Stop()
 	for {
-		if acked, err := l.checkMessageAck(ctx, expected); acked || err != nil {
+		if acked, err := l.checkChunkAck(ctx, expected); acked || err != nil {
 			return acked, err
 		}
 		select {
@@ -393,7 +466,7 @@ func (l *Link) waitMessageAck(ctx context.Context, expected frame) (bool, error)
 		case <-l.done:
 			return false, l.failure()
 		case ack := <-l.acks:
-			if isMessageAck(ack, expected) {
+			if isChunkAck(ack, expected) {
 				return true, nil
 			}
 		case <-timer.C:
@@ -402,9 +475,12 @@ func (l *Link) waitMessageAck(ctx context.Context, expected frame) (bool, error)
 	}
 }
 
-func isMessageAck(ack, expected frame) bool {
+// isChunkAck reports whether ack acknowledges the expected RaptorQ generation.
+func isChunkAck(ack, expected frame) bool {
 	return ack.id == expected.id && ack.messageLen == expected.messageLen &&
-		ack.symbolSize == expected.symbolSize
+		ack.chunkLen == expected.chunkLen && ack.chunkIndex == expected.chunkIndex &&
+		ack.chunkCount == expected.chunkCount && ack.symbolSize == expected.symbolSize &&
+		ack.kind == expectedAckKind(expected)
 }
 
 // Receive waits for the next completely reassembled message.
