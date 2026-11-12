@@ -1,4 +1,5 @@
 # fluid
+<img width="1747" height="985" alt="3cea160e4c9c1bf363617d6127a58ea7" src="https://github.com/user-attachments/assets/62c06356-2cc0-48d2-9a99-9735b3a5ccc3" />
 
 A Go link layer for transparent LoRa serial modules. It uses RaptorQ source and repair symbols, authenticates each symbol and acknowledgment with HMAC-SHA-256, and reassembles complete messages for the application.
 
