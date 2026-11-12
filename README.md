@@ -1,7 +1,13 @@
 # fluid
 <img width="1747" height="985" alt="3cea160e4c9c1bf363617d6127a58ea7" src="https://github.com/user-attachments/assets/62c06356-2cc0-48d2-9a99-9735b3a5ccc3" />
 
-A Go link layer for transparent LoRa serial modules. It uses RaptorQ source and repair symbols, authenticates each symbol and acknowledgment with HMAC-SHA-256, and reassembles complete messages for the application.
+A Go transport for transparent LoRa serial modules. It provides a bounded,
+coordinated bidirectional byte stream over an authenticated RaptorQ message
+link. Frames use HMAC-MD5; its 16-byte tag reduces overhead compared with
+HMAC-SHA-256, but MD5 is a legacy hash and has a lower security margin.
+The current protocol uses version 1. Its frame layout and HMAC-MD5
+authentication differ from earlier implementations, including earlier
+version 1 frames; upgrade both endpoints together.
 
 ## Usage
 
@@ -27,65 +33,73 @@ func main() {
 	}
 	cfg := fluid.DefaultConfig()
 	cfg.Key = key
-	link, err := fluid.Open("/dev/ttyUSB0", 9600, cfg)
+	message, err := fluid.Open("/dev/ttyUSB0", 9600, cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer link.Close()
+	defer message.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	if err := link.Send(ctx, []byte("hello LoRa")); err != nil {
+	if err := message.Send(ctx, []byte("hello LoRa")); err != nil {
 		log.Fatal(err)
 	}
 }
 ```
 
-The receiving endpoint opens its own serial port in the same way and calls `message, err := link.Receive(ctx)`. Alternatively, use `New(stream, config)` with any transparent bidirectional stream implementing `io.ReadWriteCloser`. The link owns the stream, and its `Close` method must unblock pending reads and writes. `New` copies `Config.Key` into memguard-protected memory and destroys that copy when the link closes; the caller's original key slice is not modified and remains the caller's responsibility.
+The receiving endpoint opens its own serial port in the same way and calls `data, err := message.Receive(ctx)`. Alternatively, use `New(stream, config)` with any transparent bidirectional stream implementing `io.ReadWriteCloser`. The `Message` transport owns the stream, and its `Close` method must unblock pending reads and writes. `New` copies `Config.Key` into memguard-protected memory and destroys that copy when the transport closes; the caller's original key slice is not modified and remains the caller's responsibility.
 
-### Streaming files and images
+### Bidirectional byte streams
 
-`SendStream` and `ReceiveStream` layer a streaming protocol over ordinary
-`Link` messages. Files are binary data, so images and other file types work
-without special handling. Data is buffered one block/message at a time rather
-than loading the whole file into memory. For example, with links opened as
-above:
+`Session` implements `io.ReadWriteCloser` on a fresh, exclusively owned `Message`.
+Create exactly one primary and one secondary; the primary polls and the
+secondary replies. Both directions can be read and written concurrently.
+For example, after opening a message transport on each endpoint:
 
 ```go
-// Sender: src may be an *os.File. The block size is in data bytes.
-sent, err := link.SendStream(ctx, src, 64*1024)
-// Receiver, running on the other endpoint: dst may be a temporary *os.File.
-received, err := link.ReceiveStream(ctx, dst, 1<<30) // accept at most 1 GiB
+cfg := fluid.DefaultSessionConfig()
+cfg.Primary = true // false on the other endpoint
+session, err := fluid.NewSession(message, cfg)
+if err != nil {
+	log.Fatal(err)
+}
+defer session.Close()
+// Use session.Read and session.Write concurrently as needed.
 ```
 
-These are separate endpoint calls, not calls to run sequentially on the same
-link. Check each error; the returned count is the number of bytes accepted or
-acknowledged so far. The block size plus 29 bytes must fit both endpoints'
-`MaxAppMessageBytes`; this limit must also be at least 69 bytes for the final
-message. Empty files are supported. The receiver checks the complete SHA-256
-and sends a confirmation after the writer accepts the data. A successful sender
-return confirms that check and write, not filesystem flush or durable storage.
-Receive into a temporary file, close/sync it as appropriate, and publish it only
-after successful completion; errors can leave partial or unverified output.
-If the receiver fails or cancels, the sender can wait for its own context
-deadline; cancel both sides as needed. A send error does not prove that the
-receiver did not finish. Blocked application reads and writes are not
-interrupted by context cancellation. There is no resume or file name metadata.
+`Write` accepts bytes into a bounded local buffer; it does not wait for remote
+delivery. `Flush(ctx)` waits for writes accepted before the call to be queued
+by the peer message transport, not for the peer application to read or persist them. `Close`
+is an abort: it closes the underlying transport, unblocks local calls, and may discard
+buffered data. Flush before closing if delivery is required. There is no
+graceful EOF, half-close, persistence or restart/resume; transport failures are
+reported to blocked and future operations, and a disconnected peer can be
+detected only after an exchange times out. `Read` drains already buffered
+bytes before returning a terminal error.
 
-Reserve **both directions** of a fresh `Link` for one stream transfer; do not
-run `Send`, `Receive`, or another stream concurrently. Both peers must
-implement this stream protocol and the sender's `ReplayWindow` must be at least
-the receiver's. `SendStream` paces transfers after 128 messages to respect the
-receiver's replay-ID retention; unrelated previously received messages can
-still exhaust that capacity. A long replay window can therefore limit
-throughput on fast links. All radio packet-size, buffering, turnaround, and
-half-duplex restrictions still apply; large files can take a very long time and
-may require smaller blocks, appropriate radio settings, and longer timeouts.
+The default idle poll interval is five seconds, but actual latency also includes
+airtime, ACKs, retransmissions and replay pacing. Primary and secondary take
+turns at the message level; this cannot guarantee collision-free operation on
+every radio, because serial writes may be buffered after they return. Configure
+radio packet size, timing, flow control and duty-cycle compliance for the
+hardware. One peer must be primary; both peers must use the session protocol and
+compatible `Message` configuration. `PollInterval`, `ExchangeTimeout`,
+`BufferBytes` and `BlockBytes` are configurable independently at each end.
+Buffer sizes are per direction; block size plus 42 bytes must fit the peer's
+`MaxAppMessageBytes`. Do not call other `Message` methods while Session owns it.
+
+The current implementation uses `Message` transmissions for polls and payloads and
+paces after 128 messages based on the peer's advertised replay window. Idle
+polls also consume message IDs. This can cause long stalls and restrict
+throughput, particularly with the default 10-minute replay window. Use a fresh
+message transport, set timeouts and replay windows for the actual radio retry duration, and
+do not treat this implementation as a replacement for durable delivery or
+persistent replay protection. HMAC authenticates traffic but does not encrypt.
 
 ### Ebyte hardware tests
 
-The opt-in tests in `ebyte/` cover raw serial delivery, bidirectional `Link`
-messages, and a small PNG transferred and verified in both directions. For two
+The opt-in tests in `ebyte/` cover raw serial delivery, bidirectional `Message`
+transfers, and a session. For two
 E90-DTU (400SL37) radios in normal transparent mode (M0 and M1 both ON), using
 9600 8N1 and compatible radio settings. The test generates a shared random
 link key in memory for both endpoints:
@@ -93,7 +107,7 @@ link key in memory for both endpoints:
 ```sh
 EBYTE_TEST=1 EBYTE_PORT_A=/dev/cu.usbserial-1130 \
   EBYTE_PORT_B=/dev/cu.usbserial-1110 \
-  go test -v -count=1 -timeout 5m ./ebyte -run 'TestHardware(Raw|Link|Image)$'
+  go test -v -count=1 -timeout 5m ./ebyte -run 'TestHardware(Raw|Message|Session)$'
 ```
 
 The test uses 240-byte frames and a 10-second ACK timeout. To read registers 00–06
@@ -124,7 +138,7 @@ message to finish, so the reported elapsed time may exceed one minute. Use
 `EBYTE_DURATION=20s` and `EBYTE_PAYLOAD_BYTES=512` to vary the test. For a
 controlled recovery test, set `EBYTE_DROP_FIRST_SOURCE=1` to discard the first
 source symbol of every message at the sender before it reaches the radio.
-`EBYTE_INITIAL_REPAIRS=1` enables one proactive repair symbol per chunk.
+`EBYTE_INITIAL_REPAIRS=1` enables one proactive repair symbol per message.
 Transmitted counts include the intentionally discarded frames; this models
 loss but does not measure radio-layer loss. Compare runs with and without
 proactive repairs on the actual device: extra frames can increase buffering,
@@ -137,31 +151,30 @@ and ensure the ports are not in use. They are skipped unless explicitly enabled.
 
 The context passed to `Send` can cancel waiting for the send lock and acknowledgments, but cannot interrupt a blocked underlying `Write`; close the link to interrupt it. Even when `Send` returns an error, the peer may already have received the message. Messages already queued can still be read with `Receive` after the link closes.
 
-The serial port uses 8N1. Configure the module's frequency, radio parameters, and transparent mode beforehand. This library does not implement vendor-specific AT commands, addressing, transmit/receive switching, or hardware flow control. Both endpoints must use the same key and compatible `MaxWireFrameBytes` and `MaxChunkBytes` settings. `MaxWireFrameBytes` includes the complete serial frame and must not exceed the module's single radio payload limit; the module must not insert extra bytes while a complete frame is written. Serial packetization, radio payload limits, and transmit timing vary by module and must be verified on actual hardware. LoRa is generally half-duplex: applications must coordinate transmissions to avoid radio collisions, and configure acknowledgment timeouts according to the actual air rate, transmission time, and regulatory limits.
+The serial port uses 8N1. Configure the module's frequency, radio parameters, and transparent mode beforehand. This library does not implement vendor-specific AT commands, addressing, transmit/receive switching, or hardware flow control. Both endpoints must use the same key and compatible `MaxWireFrameBytes` and `MaxAppMessageBytes` settings. `MaxWireFrameBytes` includes the complete serial frame and must not exceed the module's single radio payload limit; the module must not insert extra bytes while a complete frame is written. Serial packetization, radio payload limits, and transmit timing vary by module and must be verified on actual hardware. LoRa is generally half-duplex: applications must coordinate transmissions to avoid radio collisions, and configure acknowledgment timeouts according to the actual air rate, transmission time, and regulatory limits.
 
 ### Configuration
 
-`DefaultConfig()` returns a starter configuration for transparent serial LoRa modules. It assumes the module accepts 255-byte wire frames; lower `MaxWireFrameBytes` to the actual radio payload limit if needed. Air rate, spreading factor, coding rate, module turnaround, and regulatory duty-cycle limits vary, so tune `AckTimeout` and application message sizes for the actual link. `MaxAppMessageBytes` limits one complete application message; the library splits it into independently encoded RaptorQ chunks of at most `MaxChunkBytes` and reassembles it before delivery. The defaults are 1 MiB per application message and 32 KiB per RaptorQ chunk. These are upper bounds, not recommendations to send large messages over a low-rate LoRa link. The same values are applied to zero-valued fields when using `Config{Key: key}` directly.
+`DefaultConfig()` returns a starter configuration for transparent serial LoRa modules. It assumes the module accepts 255-byte wire frames; lower `MaxWireFrameBytes` to the actual radio payload limit if needed. Air rate, spreading factor, coding rate, module turnaround, and regulatory duty-cycle limits vary, so tune `AckTimeout` and application message sizes for the actual link. `MaxAppMessageBytes` limits one complete application message, which is encoded as one RaptorQ generation. Session breaks the byte stream into separate bounded messages using `BlockBytes`. The default 1 MiB message limit is an upper bound, not a recommendation to send large messages over a low-rate LoRa link. The same values are applied to zero-valued fields when using `Config{Key: key}` directly.
 
 | Field | Default | Description |
 | --- | --- | --- |
 | `MaxWireFrameBytes` | 255 | Maximum complete encoded wire frame size in bytes, including COBS and delimiter; 76–65535 |
 | `MaxAppMessageBytes` | 1 MiB | Maximum complete application message size in bytes; empty messages are not supported |
-| `MaxChunkBytes` | 32 KiB | Maximum input bytes for each independent RaptorQ generation |
-| `AckTimeout` | 3 seconds | Time to wait for a chunk or message-completion acknowledgment after a source stream or repair batch |
-| `MaxRetries` | 5 | Maximum additional repair-symbol batches per chunk after its initial source-symbol stream |
+| `AckTimeout` | 3 seconds | Time to wait for a message-completion acknowledgment after a source stream or repair batch |
+| `MaxRetries` | 5 | Maximum additional repair-symbol batches per message after its initial source-symbol stream |
 | `InitialRepairSymbols` | 0 | Maximum proactive repair symbols sent after each source stream before waiting for an ACK |
 | `ReceiveTimeout` | 2 minutes | Retention time for an incomplete message without a valid fragment |
 | `ReplayWindow` | 10 minutes | Retention time for completed message IDs used for deduplication |
 
-Each RaptorQ chunk can contain at most 56403 source symbols; repair symbols use 24-bit encoding symbol IDs. The library automatically reduces a chunk below `MaxChunkBytes` if needed to fit that RaptorQ limit for the configured frame and symbol sizes. Larger application messages require more encoding computation, memory, and transmission time. The acknowledgment timeout should exceed the time needed to transmit a complete frame over the air and switch the device's direction. The receive timeout and replay window should also cover the longest retry interval.
+Each RaptorQ generation can contain at most 56403 source symbols; repair symbols use 24-bit encoding symbol IDs. Messages exceeding that limit for the configured symbol size are rejected. Larger application messages require more encoding computation, memory, and transmission time. The acknowledgment timeout should exceed the time needed to transmit a complete frame over the air and switch the device's direction. The receive timeout and replay window should also cover the longest retry interval.
 
 ## Protocol and guarantees
 
-- Frames use COBS encoding with a zero-byte delimiter. The version, type, 128-bit message ID (a random 64-bit link instance ID and 64-bit message ID), symbol ID, complete message length, chunk length/index/count, symbol size, and symbol content are protected by HMAC. The receiver verifies this HMAC before passing each source or repair symbol to RaptorQ. Chunk and final acknowledgment frames are authenticated and bound to the message and chunk metadata. Corrupt, unauthenticated, or invalid frames are discarded without acknowledgment. The link also ignores its own echoed data frames to avoid mistaking them for peer acknowledgments.
-- The sender splits each application message into ordered chunks. Each chunk gets an independent RaptorQ generation; its source symbols are streamed without per-symbol acknowledgments, followed by progressively larger batches of new repair symbols if needed. A chunk ACK advances to the next generation; the final message-completion ACK is sent only after all chunks are reassembled and queued. `MaxRetries` applies per chunk.
+- Frames use COBS encoding with a zero-byte delimiter. The version, type, 128-bit message ID (a random 64-bit link instance ID and 64-bit message ID), symbol ID, complete message length, symbol size, and symbol content are protected by HMAC-MD5. The receiver verifies the 16-byte tag before passing each source or repair symbol to RaptorQ. Message acknowledgment frames are authenticated and bound to the message metadata. Corrupt, unauthenticated, or invalid frames are discarded without acknowledgment. The link also ignores its own echoed data frames to avoid mistaking them for peer acknowledgments.
+- Each application message is one independent RaptorQ generation; its source symbols are streamed without per-symbol acknowledgments, followed by progressively larger batches of new repair symbols if needed. The message-completion ACK is sent only after the message is decoded and queued.
 - Optionally, `InitialRepairSymbols` sends repair symbols before the first ACK wait. This can reduce timeout latency when symbols are lost, but adds traffic and can cause collisions or overflow radio buffers. It is disabled by default and does not change the wire format or need matching configuration at the receiver. The sender may stop early upon receiving an ACK; later repair batches use fresh symbol IDs.
-- The receiver accepts source and repair symbols for the active chunk in any order and acknowledges completed non-final chunks so the sender can proceed. It sends a final message-completion acknowledgment only after the complete application message is reassembled and queued. Retries of completed chunks or messages are acknowledged without duplicate delivery. A successful `Send` means the receiving link layer has reassembled and queued the entire message; it **does not mean the application has read or processed it**. `Receive` should be called continuously to consume messages. When the queue is full, the final message is not acknowledged; a later repair symbol retries queueing.
+- The receiver accepts source and repair symbols in any order and sends a message-completion acknowledgment only after the message is decoded and queued. Retries of completed messages are acknowledged without duplicate delivery. A successful `Send` means the receiving link layer has queued the entire message; it **does not mean the application has read or processed it**. `Receive` should be called continuously to consume messages. When the queue is full, the message is not acknowledged; a later repair symbol retries queueing.
 - Each endpoint can handle at most one outgoing and one incoming message at a time; concurrent `Send` calls queue locally. An incoming message canceled or abandoned by its sender occupies the receiver until `ReceiveTimeout`; other messages are not acknowledged during that time.
 - Completed message IDs are retained in memory for `ReplayWindow`, so retries with the same ID are not delivered twice. At most 128 unexpired IDs are retained; when the limit is reached, new messages are not acknowledged until an entry expires. This is not persistent replay protection: old messages may be received again after the window expires or the process restarts. A send timeout or cancellation can also occur after the peer has received the message. Applications requiring exactly-once processing across restarts must maintain persistent message IDs and deduplication themselves.
 - HMAC provides authentication between holders of the shared key and fragment integrity. It does not provide encryption, key exchange, identity separation between key holders, or application-layer integrity for the complete message. Do not share a key among mutually untrusted nodes. Applications should verify complete messages themselves and encrypt them if needed.

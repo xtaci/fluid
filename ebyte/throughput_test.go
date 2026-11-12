@@ -24,8 +24,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -41,7 +41,6 @@ import (
 
 type symbolID struct {
 	message [16]byte
-	chunk   uint32
 	index   uint32
 }
 
@@ -58,24 +57,23 @@ func newFrameCounts() *frameCounts {
 
 func (c *frameCounts) record(packet, key []byte) {
 	raw, ok := decodeCOBS(packet)
-	if !ok || len(raw) < 72 {
+	if !ok || len(raw) < 28+md5.Size {
 		return
 	}
-	mac := hmac.New(sha256.New, key)
-	mac.Write(raw[:len(raw)-sha256.Size])
-	if !hmac.Equal(mac.Sum(nil), raw[len(raw)-sha256.Size:]) || raw[0] != 1 || raw[1] != 1 {
+	mac := hmac.New(md5.New, key)
+	mac.Write(raw[:len(raw)-md5.Size])
+	if !hmac.Equal(mac.Sum(nil), raw[len(raw)-md5.Size:]) || raw[0] != 1 || raw[1] != 1 {
 		return
 	}
-	symbolSize := binary.BigEndian.Uint16(raw[38:40])
+	symbolSize := binary.BigEndian.Uint16(raw[26:28])
 	if symbolSize == 0 {
 		return
 	}
 	var id symbolID
 	copy(id.message[:], raw[2:18])
 	id.index = binary.BigEndian.Uint32(raw[18:22])
-	id.chunk = binary.BigEndian.Uint32(raw[30:34])
-	chunkLen := binary.BigEndian.Uint32(raw[26:30])
-	sourceCount := (uint64(chunkLen) + uint64(symbolSize) - 1) / uint64(symbolSize)
+	messageLen := binary.BigEndian.Uint32(raw[22:26])
+	sourceCount := (uint64(messageLen) + uint64(symbolSize) - 1) / uint64(symbolSize)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.frames++
@@ -136,7 +134,7 @@ func (s *observedStream) Read(p []byte) (int, error) {
 func (s *observedStream) Write(p []byte) (int, error) {
 	if s.dropFirstSource && len(p) > 1 && p[len(p)-1] == 0 {
 		raw, ok := decodeCOBS(p[:len(p)-1])
-		if ok && len(raw) >= 72 && raw[0] == 1 && raw[1] == 1 &&
+		if ok && len(raw) >= 28+md5.Size && raw[0] == 1 && raw[1] == 1 &&
 			binary.BigEndian.Uint32(raw[18:22]) == 0 {
 			observe(p, &s.writeBuf, s.written, s.key)
 			s.injectedDrops++
@@ -162,15 +160,15 @@ func TestFrameObservation(t *testing.T) {
 	key := bytes.Repeat([]byte{0x42}, 32)
 	counts := newFrameCounts()
 	packet := func(index uint32) []byte {
-		raw := make([]byte, 40+4+sha256.Size)
+		raw := make([]byte, 28+4+md5.Size)
 		raw[0], raw[1] = 1, 1
 		raw[2] = 9
 		binary.BigEndian.PutUint32(raw[18:22], index)
-		binary.BigEndian.PutUint32(raw[26:30], 7)
-		binary.BigEndian.PutUint16(raw[38:40], 4)
-		mac := hmac.New(sha256.New, key)
-		mac.Write(raw[:len(raw)-sha256.Size])
-		copy(raw[len(raw)-sha256.Size:], mac.Sum(nil))
+		binary.BigEndian.PutUint32(raw[22:26], 7)
+		binary.BigEndian.PutUint16(raw[26:28], 4)
+		mac := hmac.New(md5.New, key)
+		mac.Write(raw[:len(raw)-md5.Size])
+		copy(raw[len(raw)-md5.Size:], mac.Sum(nil))
 		encoded := []byte{0}
 		codePos, code := 0, byte(1)
 		for _, b := range raw {

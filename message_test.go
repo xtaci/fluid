@@ -23,6 +23,10 @@ package fluid
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -46,7 +50,6 @@ func testConfig() Config {
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.MaxWireFrameBytes != 255 || cfg.MaxAppMessageBytes != 1<<20 ||
-		cfg.MaxChunkBytes != 32<<10 ||
 		cfg.AckTimeout != 3*time.Second || cfg.MaxRetries != 5 ||
 		cfg.ReceiveTimeout != 2*time.Minute || cfg.ReplayWindow != 10*time.Minute {
 		t.Fatalf("unexpected default config: %+v", cfg)
@@ -183,7 +186,6 @@ type raptorqMessageStats struct {
 }
 
 type raptorqSymbolID struct {
-	chunk uint32
 	index uint32
 }
 
@@ -208,7 +210,7 @@ func (s *raptorqInputStats) record(packet []byte) {
 		stats = &raptorqMessageStats{seen: make(map[raptorqSymbolID]struct{})}
 		s.messages[f.id] = stats
 	}
-	symbolID := raptorqSymbolID{chunk: f.chunkIndex, index: f.index}
+	symbolID := raptorqSymbolID{index: f.index}
 	if _, ok := stats.seen[symbolID]; ok {
 		return
 	}
@@ -289,7 +291,7 @@ func (s *filterStream) Write(p []byte) (int, error) {
 }
 
 // pair creates two linked endpoints with optional directional frame filters.
-func pair(t *testing.T, leftFilter, rightFilter func([]byte) []byte) (*Link, *Link) {
+func pair(t *testing.T, leftFilter, rightFilter func([]byte) []byte) (*Message, *Message) {
 	t.Helper()
 	a, b := net.Pipe()
 	left, err := New(&filterStream{a, leftFilter}, testConfig())
@@ -304,7 +306,7 @@ func pair(t *testing.T, leftFilter, rightFilter func([]byte) []byte) (*Link, *Li
 	return left, right
 }
 
-func lossyPair(t *testing.T, cfg lossyconn.Config, linkCfg Config, inputStats *raptorqInputStats) (*Link, *Link, *lossyconn.LossyConn, *lossyconn.LossyConn) {
+func lossyPair(t *testing.T, cfg lossyconn.Config, messageCfg Config, inputStats *raptorqInputStats) (*Message, *Message, *lossyconn.LossyConn, *lossyconn.LossyConn) {
 	t.Helper()
 	leftConn, err := lossyconn.NewWithConfig(cfg)
 	if err != nil {
@@ -317,13 +319,13 @@ func lossyPair(t *testing.T, cfg lossyconn.Config, linkCfg Config, inputStats *r
 		_ = leftConn.Close()
 		t.Fatal(err)
 	}
-	left, err := New(&lossyPacketStream{conn: leftConn, peer: rightConn.LocalAddr(), onWrite: inputStats.recordSent}, linkCfg)
+	left, err := New(&lossyPacketStream{conn: leftConn, peer: rightConn.LocalAddr(), onWrite: inputStats.recordSent}, messageCfg)
 	if err != nil {
 		_ = leftConn.Close()
 		_ = rightConn.Close()
 		t.Fatal(err)
 	}
-	right, err := New(&lossyPacketStream{conn: rightConn, peer: leftConn.LocalAddr(), onRead: inputStats.record}, linkCfg)
+	right, err := New(&lossyPacketStream{conn: rightConn, peer: leftConn.LocalAddr(), onRead: inputStats.record}, messageCfg)
 	if err != nil {
 		_ = left.Close()
 		_ = rightConn.Close()
@@ -484,7 +486,7 @@ func TestAcknowledgmentHMACRequired(t *testing.T) {
 	}
 }
 
-// TestCloseUnblocksReceive checks that a closed link returns its terminal error.
+// TestCloseUnblocksReceive checks that a closed message returns its terminal error.
 func TestCloseUnblocksReceive(t *testing.T) {
 	left, _ := pair(t, nil, nil)
 	if err := left.Close(); err != nil {
@@ -515,22 +517,22 @@ func TestQueuedMessageSurvivesDisconnect(t *testing.T) {
 // TestEchoCannotAcknowledgeOwnMessage checks that serial echoes are ignored.
 func TestEchoCannotAcknowledgeOwnMessage(t *testing.T) {
 	a, b := net.Pipe()
-	link, err := New(a, testConfig())
+	message, err := New(a, testConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer link.Close()
+	defer message.Close()
 	defer b.Close()
 	go func() { _, _ = io.Copy(b, b) }()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err = link.Send(ctx, []byte("echo"))
+	err = message.Send(ctx, []byte("echo"))
 	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("message acknowledgment timeout")) {
 		t.Fatalf("Send = %v, want message acknowledgment timeout", err)
 	}
 	short, stop := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer stop()
-	if _, err := link.Receive(short); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := message.Receive(short); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("received own message: %v", err)
 	}
 }
@@ -547,80 +549,6 @@ func TestLargeMessage(t *testing.T) {
 	got, err := right.Receive(ctx)
 	if err != nil || !bytes.Equal(got, msg) {
 		t.Fatalf("large message: length %d, error %v", len(got), err)
-	}
-}
-
-// TestSendReceiveAutomaticChunking verifies independent RaptorQ chunks and
-// confirms that only final reassembly produces the message-completion ACK.
-func TestSendReceiveAutomaticChunking(t *testing.T) {
-	var mu sync.Mutex
-	seenChunks := make(map[uint32]map[uint32]struct{})
-	chunkAcks, finalAcks := 0, 0
-	droppedChunkAck, droppedFinalAck := false, false
-	left, right := pair(t, func(p []byte) []byte {
-		f := frameFromPacket(t, p)
-		if f.kind == frameData {
-			mu.Lock()
-			if seenChunks[f.chunkIndex] == nil {
-				seenChunks[f.chunkIndex] = make(map[uint32]struct{})
-			}
-			seenChunks[f.chunkIndex][f.index] = struct{}{}
-			mu.Unlock()
-		}
-		return p
-	}, func(p []byte) []byte {
-		f := frameFromPacket(t, p)
-		mu.Lock()
-		defer mu.Unlock()
-		switch f.kind {
-		case frameChunkAck:
-			chunkAcks++
-			if !droppedChunkAck {
-				droppedChunkAck = true
-				return nil
-			}
-		case frameAck:
-			finalAcks++
-			if !droppedFinalAck {
-				droppedFinalAck = true
-				return nil
-			}
-		}
-		return p
-	})
-	msg := make([]byte, 70<<10)
-	for i := range msg {
-		msg[i] = byte(i*31 + i/7)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := left.Send(ctx, msg); err != nil {
-		t.Fatal(err)
-	}
-	got, err := right.Receive(ctx)
-	if err != nil || !bytes.Equal(got, msg) {
-		t.Fatalf("Receive = %d bytes, %v", len(got), err)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(seenChunks) != 3 {
-		t.Fatalf("sent %d chunks, want 3", len(seenChunks))
-	}
-	for chunk := uint32(0); chunk < 3; chunk++ {
-		if _, ok := seenChunks[chunk][0]; !ok {
-			t.Errorf("chunk %d did not start an independent RaptorQ generation: %v", chunk, seenChunks[chunk])
-		}
-	}
-	if chunkAcks < 3 {
-		t.Fatalf("got %d chunk ACKs, want retry after dropping the first", chunkAcks)
-	}
-	if finalAcks < 2 {
-		t.Fatalf("got %d final message ACKs, want a retry after dropping the first", finalAcks)
-	}
-	short, stop := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer stop()
-	if _, err := right.Receive(short); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("duplicate message after lost final ACK: %v", err)
 	}
 }
 
@@ -655,17 +583,17 @@ func testLossyMessageSizes(t *testing.T, lossRate, corruptionRate float64, seed 
 		MaxPacketSize:  255,
 		Seed:           seed,
 	}
-	linkCfg := testConfig()
+	messageCfg := testConfig()
 	// Each encoded frame is one lossyconn datagram, so the protocol's frame
-	// limit must not exceed the simulated link's packet-size limit.
-	linkCfg.MaxWireFrameBytes = lossCfg.MaxPacketSize
-	linkCfg.AckTimeout = 20 * time.Millisecond
-	linkCfg.MaxRetries = 100
+	// limit must not exceed the simulated message's packet-size limit.
+	messageCfg.MaxWireFrameBytes = lossCfg.MaxPacketSize
+	messageCfg.AckTimeout = 20 * time.Millisecond
+	messageCfg.MaxRetries = 100
 	inputStats := &raptorqInputStats{}
-	left, right, leftConn, rightConn := lossyPair(t, lossCfg, linkCfg, inputStats)
+	left, right, leftConn, rightConn := lossyPair(t, lossCfg, messageCfg, inputStats)
 	symbolSize := left.symbolSize()
 	if symbolSize <= 0 {
-		t.Fatalf("invalid symbol size %d for max frame size %d", symbolSize, linkCfg.MaxWireFrameBytes)
+		t.Fatalf("invalid symbol size %d for max frame size %d", symbolSize, messageCfg.MaxWireFrameBytes)
 	}
 	maxFrame := marshalFrame(frame{
 		kind:       frameData,
@@ -674,7 +602,7 @@ func testLossyMessageSizes(t *testing.T, lossRate, corruptionRate float64, seed 
 		payload:    bytes.Repeat([]byte{0xff}, symbolSize),
 	}, testKey)
 	if len(maxFrame) > lossCfg.MaxPacketSize {
-		t.Fatalf("maximum encoded frame size %d exceeds link packet limit %d", len(maxFrame), lossCfg.MaxPacketSize)
+		t.Fatalf("maximum encoded frame size %d exceeds message packet limit %d", len(maxFrame), lossCfg.MaxPacketSize)
 	}
 	sizes := []int{1, 128, 4096, 16384}
 	var totalRandomDrops, totalBurstDrops, totalCorrupted, totalDataCorrupted uint64
@@ -723,7 +651,7 @@ func testLossyMessageSizes(t *testing.T, lossRate, corruptionRate float64, seed 
 		oversizeDrops := afterLeft.DropOversize - beforeLeft.DropOversize +
 			afterRight.DropOversize - beforeRight.DropOversize
 		if oversizeDrops != 0 {
-			t.Fatalf("message_bytes=%d produced %d frames over link packet limit %d",
+			t.Fatalf("message_bytes=%d produced %d frames over message packet limit %d",
 				size, oversizeDrops, lossCfg.MaxPacketSize)
 		}
 		repairSymbols := dataPackets - dataSymbols
@@ -788,6 +716,49 @@ func TestFrameEncoding(t *testing.T) {
 	}
 }
 
+func TestFrameHMACMD5AndVersion(t *testing.T) {
+	f := frame{kind: frameData, messageLen: 3, symbolSize: 3, payload: []byte("abc")}
+	packet := marshalFrame(f, testKey)
+	raw, err := cobsDecode(packet[:len(packet)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != headerSize+3+16 || raw[0] != 1 {
+		t.Fatalf("unexpected frame size or version: %d, %d", len(raw), raw[0])
+	}
+	if got := hex.EncodeToString(raw[len(raw)-16:]); got != "30ea02a111ed2daa6a61db879c1a0282" {
+		t.Fatalf("unexpected HMAC-MD5: %s", got)
+	}
+	decoded, err := parseFrame(packet[:len(packet)-1], testKey)
+	if err != nil || !bytes.Equal(decoded.payload, f.payload) {
+		t.Fatalf("parse valid frame: %v", err)
+	}
+	old := append([]byte(nil), raw[:len(raw)-16]...)
+	old[0] = 1
+	mac := hmac.New(sha256.New, testKey)
+	mac.Write(old)
+	old = append(old, mac.Sum(nil)...)
+	if _, err := parseFrame(cobsEncode(old), testKey); err == nil {
+		t.Fatal("legacy HMAC-SHA-256 frame accepted")
+	}
+	v2 := make([]byte, 40+len(f.payload))
+	v2[0], v2[1] = 2, frameData
+	copy(v2[40:], f.payload)
+	v2MAC := hmac.New(md5.New, testKey)
+	v2MAC.Write(v2)
+	v2 = append(v2, v2MAC.Sum(nil)...)
+	if _, err := parseFrame(cobsEncode(v2), testKey); err == nil || err.Error() != "unsupported frame" {
+		t.Fatalf("authenticated version 2 frame should be rejected: %v", err)
+	}
+	for _, index := range []int{0, 1, 21, headerSize, len(raw) - 1} {
+		bad := append([]byte(nil), raw...)
+		bad[index] ^= 1
+		if _, err := parseFrame(cobsEncode(bad), testKey); err == nil {
+			t.Fatalf("tampering at byte %d accepted", index)
+		}
+	}
+}
+
 func TestFrameHMACProtectsSourceAndRepairSymbols(t *testing.T) {
 	for _, index := range []uint32{0, 1} {
 		f := frame{
@@ -820,7 +791,7 @@ func TestConfigAndFrameLimit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		l := &Link{cfg: cfg}
+		l := &Message{cfg: cfg}
 		f := frame{kind: frameData, payload: bytes.Repeat([]byte{1}, l.symbolSize())}
 		if n := len(marshalFrame(f, testKey)); n > max {
 			t.Fatalf("frame size %d exceeds %d", n, max)
@@ -831,12 +802,34 @@ func TestConfigAndFrameLimit(t *testing.T) {
 	}
 }
 
-func TestLinkProtectsConfigKey(t *testing.T) {
+func TestMessageSingleGenerationLimit(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxWireFrameBytes = 76
+	cfg.MaxAppMessageBytes = 4 << 20
+	a, b := net.Pipe()
+	message, err := New(a, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer message.Close()
+	defer b.Close()
+	limit := maxSourceSymbols * message.symbolSize()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := message.Send(ctx, make([]byte, limit)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("maximum generation rejected: %v", err)
+	}
+	if err := message.Send(ctx, make([]byte, limit+1)); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("oversized generation not rejected: %v", err)
+	}
+}
+
+func TestMessageProtectsConfigKey(t *testing.T) {
 	keyBytes := bytes.Repeat([]byte{0x73}, 32)
 	cfg := testConfig()
 	cfg.Key = keyBytes
 	left, right := net.Pipe()
-	link, err := New(left, cfg)
+	message, err := New(left, cfg)
 	if err != nil {
 		_ = left.Close()
 		_ = right.Close()
@@ -844,20 +837,20 @@ func TestLinkProtectsConfigKey(t *testing.T) {
 	}
 	defer right.Close()
 
-	if link.cfg.Key != nil {
-		t.Fatal("Link retained the key in ordinary Config memory")
+	if message.cfg.Key != nil {
+		t.Fatal("Message retained the key in ordinary Config memory")
 	}
-	if link.key == nil || !link.key.IsAlive() || !bytes.Equal(link.key.Bytes(), keyBytes) {
-		t.Fatal("Link did not retain the key in protected memory")
+	if message.key == nil || !message.key.IsAlive() || !bytes.Equal(message.key.Bytes(), keyBytes) {
+		t.Fatal("Message did not retain the key in protected memory")
 	}
 	if !bytes.Equal(keyBytes, bytes.Repeat([]byte{0x73}, 32)) {
 		t.Fatal("New modified the caller's key slice")
 	}
-	if err := link.Close(); err != nil {
+	if err := message.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if link.key.IsAlive() {
-		t.Fatal("Link did not destroy the protected key on close")
+	if message.key.IsAlive() {
+		t.Fatal("Message did not destroy the protected key on close")
 	}
 }
 

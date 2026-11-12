@@ -25,9 +25,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"image"
-	"image/color"
-	"image/png"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -103,7 +101,7 @@ func TestHardwareRegisters(t *testing.T) {
 	}
 }
 
-// TestHardwareRaw checks transparent serial delivery before using Link.
+// TestHardwareRaw checks transparent serial delivery before using Message.
 func TestHardwareRaw(t *testing.T) {
 	a, b := ports(t)
 	left, right := openPort(t, a), openPort(t, b)
@@ -142,7 +140,7 @@ func TestHardwareRaw(t *testing.T) {
 	}
 }
 
-func openLinks(t *testing.T) (*fluid.Link, *fluid.Link) {
+func openMessages(t *testing.T) (*fluid.Message, *fluid.Message) {
 	t.Helper()
 	a, b := ports(t)
 	key := make([]byte, 32)
@@ -155,29 +153,29 @@ func openLinks(t *testing.T) (*fluid.Link, *fluid.Link) {
 	cfg.MaxWireFrameBytes = 240
 	cfg.AckTimeout = 10 * time.Second
 	cfg.MaxRetries = 2
-	open := func(name string) *fluid.Link {
-		link, err := fluid.Open(name, 9600, cfg)
+	open := func(name string) *fluid.Message {
+		message, err := fluid.Open(name, 9600, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() {
-			if err := link.Close(); err != nil {
+			if err := message.Close(); err != nil {
 				t.Errorf("close %s: %v", name, err)
 			}
 		})
-		return link
+		return message
 	}
 	return open(a), open(b)
 }
 
-func TestHardwareLink(t *testing.T) {
-	left, right := openLinks(t)
+func TestHardwareMessage(t *testing.T) {
+	left, right := openMessages(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	for _, step := range []struct {
 		name string
-		from *fluid.Link
-		to   *fluid.Link
+		from *fluid.Message
+		to   *fluid.Message
 		text string
 	}{
 		{"A-to-B", left, right, "fluid test A to B"},
@@ -194,46 +192,61 @@ func TestHardwareLink(t *testing.T) {
 	}
 }
 
-func TestHardwareImage(t *testing.T) {
-	left, right := openLinks(t)
-	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
-	img.Set(0, 0, color.RGBA{R: 255, A: 255})
-	var source bytes.Buffer
-	if err := png.Encode(&source, img); err != nil {
+func TestHardwareSession(t *testing.T) {
+	left, right := openMessages(t)
+	cfg := fluid.DefaultSessionConfig()
+	cfg.PollInterval = 5 * time.Second
+	cfg.BlockBytes = 128
+	cfg.BufferBytes = 512
+	secondary, err := fluid.NewSession(right, cfg)
+	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	for _, step := range []struct {
-		name string
-		from *fluid.Link
-		to   *fluid.Link
-	}{
-		{"A-to-B", left, right},
-		{"B-to-A", right, left},
-	} {
-		var output bytes.Buffer
-		result := make(chan error, 1)
-		go func() {
-			n, err := step.to.ReceiveStream(ctx, &output, uint64(source.Len()))
-			if err == nil && n != uint64(source.Len()) {
-				err = fmt.Errorf("received %d bytes, expected %d", n, source.Len())
-			}
-			result <- err
-		}()
-		n, err := step.from.SendStream(ctx, bytes.NewReader(source.Bytes()), 64)
-		if err != nil {
-			t.Fatalf("%s send: %v", step.name, err)
-		}
-		if err := <-result; err != nil {
-			t.Fatalf("%s receive: %v", step.name, err)
-		}
-		if !bytes.Equal(source.Bytes(), output.Bytes()) {
-			t.Fatalf("%s: PNG bytes differ", step.name)
-		}
-		if _, err := png.Decode(bytes.NewReader(output.Bytes())); err != nil {
-			t.Fatalf("%s: decode PNG: %v", step.name, err)
-		}
-		t.Logf("%s: verified %d-byte PNG", step.name, n)
+	defer secondary.Close()
+	cfg.Primary = true
+	primary, err := fluid.NewSession(left, cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer primary.Close()
+	a := bytes.Repeat([]byte{0, 1, 2, 255}, 64)
+	b := bytes.Repeat([]byte{8, 0, 7, 42}, 64)
+	results := make(chan error, 4)
+	go func() { _, err := primary.Write(a); results <- err }()
+	go func() { _, err := secondary.Write(b); results <- err }()
+	go func() {
+		got := make([]byte, len(b))
+		_, err := io.ReadFull(primary, got)
+		if err == nil && !bytes.Equal(got, b) {
+			err = fmt.Errorf("primary received incorrect bytes")
+		}
+		results <- err
+	}()
+	go func() {
+		got := make([]byte, len(a))
+		_, err := io.ReadFull(secondary, got)
+		if err == nil && !bytes.Equal(got, a) {
+			err = fmt.Errorf("secondary received incorrect bytes")
+		}
+		results <- err
+	}()
+	for i := 0; i < 4; i++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Minute):
+			t.Fatal("session transfer timed out")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := primary.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := secondary.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("bidirectional session: verified %d bytes in each direction", len(a))
 }
