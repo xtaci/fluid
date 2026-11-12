@@ -42,6 +42,25 @@ func main() {
 
 The receiving endpoint opens its own serial port in the same way and calls `message, err := link.Receive(ctx)`. Alternatively, use `New(stream, config)` with any transparent bidirectional stream implementing `io.ReadWriteCloser`. The link owns the stream, and its `Close` method must unblock pending reads and writes. `New` copies `Config.Key` into memguard-protected memory and destroys that copy when the link closes; the caller's original key slice is not modified and remains the caller's responsibility.
 
+### Serial chat
+
+The `cmd/chat` command sends each nonempty input line as a message and
+continuously prints incoming messages. Run it on both endpoints with the same
+binary key file (at least 32 random bytes), using each endpoint's serial port:
+
+```sh
+go run ./cmd/chat -port /dev/ttyUSB0 -baud 9600 -key link.key
+# On Windows, for example: go run ./cmd/chat -port COM3 -baud 9600 -key link.key
+```
+
+Use `-frame`, `-ack-timeout`, and `-retries` to adjust the link to the radio;
+run `go run ./cmd/chat -help` for the defaults. Both endpoints need compatible
+frame settings. Ctrl-C or end-of-file exits; end-of-file closes the link after
+the last input line is sent, so keep standard input open to continue receiving.
+If sending fails, the program exits with an error, but the peer may already
+have received the message. The chat is authenticated, **not encrypted**.
+On half-duplex radios, take turns sending to avoid collisions.
+
 The context passed to `Send` can cancel waiting for the send lock and acknowledgments, but cannot interrupt a blocked underlying `Write`; close the link to interrupt it. Even when `Send` returns an error, the peer may already have received the message. Messages already queued can still be read with `Receive` after the link closes.
 
 The serial port uses 8N1. Configure the module's frequency, radio parameters, and transparent mode beforehand. This library does not implement vendor-specific AT commands, addressing, transmit/receive switching, or hardware flow control. Both endpoints must use the same key and compatible `MaxWireFrameBytes` and `MaxChunkBytes` settings. `MaxWireFrameBytes` includes the complete serial frame and must not exceed the module's single radio payload limit; the module must not insert extra bytes while a complete frame is written. Serial packetization, radio payload limits, and transmit timing vary by module and must be verified on actual hardware. LoRa is generally half-duplex: applications must coordinate transmissions to avoid radio collisions, and configure acknowledgment timeouts according to the actual air rate, transmission time, and regulatory limits.
