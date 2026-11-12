@@ -43,24 +43,87 @@ func main() {
 
 The receiving endpoint opens its own serial port in the same way and calls `message, err := link.Receive(ctx)`. Alternatively, use `New(stream, config)` with any transparent bidirectional stream implementing `io.ReadWriteCloser`. The link owns the stream, and its `Close` method must unblock pending reads and writes. `New` copies `Config.Key` into memguard-protected memory and destroys that copy when the link closes; the caller's original key slice is not modified and remains the caller's responsibility.
 
-### Serial chat
+### Streaming files and images
 
-The `cmd/chat` command sends each nonempty input line as a message and
-continuously prints incoming messages. Run it on both endpoints with the same
-binary key file (at least 32 random bytes), using each endpoint's serial port:
+`SendStream` and `ReceiveStream` layer a streaming protocol over ordinary
+`Link` messages. Files are binary data, so images and other file types work
+without special handling. Data is buffered one block/message at a time rather
+than loading the whole file into memory. For example, with links opened as
+above:
 
-```sh
-go run ./cmd/chat -port /dev/ttyUSB0 -baud 9600 -key link.key
-# On Windows, for example: go run ./cmd/chat -port COM3 -baud 9600 -key link.key
+```go
+// Sender: src may be an *os.File. The block size is in data bytes.
+sent, err := link.SendStream(ctx, src, 64*1024)
+// Receiver, running on the other endpoint: dst may be a temporary *os.File.
+received, err := link.ReceiveStream(ctx, dst, 1<<30) // accept at most 1 GiB
 ```
 
-Use `-frame`, `-ack-timeout`, and `-retries` to adjust the link to the radio;
-run `go run ./cmd/chat -help` for the defaults. Both endpoints need compatible
-frame settings. Ctrl-C or end-of-file exits; end-of-file closes the link after
-the last input line is sent, so keep standard input open to continue receiving.
-If sending fails, the program exits with an error, but the peer may already
-have received the message. The chat is authenticated, **not encrypted**.
-On half-duplex radios, take turns sending to avoid collisions.
+These are separate endpoint calls, not calls to run sequentially on the same
+link. Check each error; the returned count is the number of bytes accepted or
+acknowledged so far. The block size plus 29 bytes must fit both endpoints'
+`MaxAppMessageBytes`; this limit must also be at least 69 bytes for the final
+message. Empty files are supported. The receiver checks the complete SHA-256
+and sends a confirmation after the writer accepts the data. A successful sender
+return confirms that check and write, not filesystem flush or durable storage.
+Receive into a temporary file, close/sync it as appropriate, and publish it only
+after successful completion; errors can leave partial or unverified output.
+If the receiver fails or cancels, the sender can wait for its own context
+deadline; cancel both sides as needed. A send error does not prove that the
+receiver did not finish. Blocked application reads and writes are not
+interrupted by context cancellation. There is no resume or file name metadata.
+
+Reserve **both directions** of a fresh `Link` for one stream transfer; do not
+run `Send`, `Receive`, or another stream concurrently. Both peers must
+implement this stream protocol and the sender's `ReplayWindow` must be at least
+the receiver's. `SendStream` paces transfers after 128 messages to respect the
+receiver's replay-ID retention; unrelated previously received messages can
+still exhaust that capacity. A long replay window can therefore limit
+throughput on fast links. All radio packet-size, buffering, turnaround, and
+half-duplex restrictions still apply; large files can take a very long time and
+may require smaller blocks, appropriate radio settings, and longer timeouts.
+
+### Ebyte hardware tests
+
+The opt-in tests in `ebyte/` cover raw serial delivery, bidirectional `Link`
+messages, and a small PNG transferred and verified in both directions. For two
+E90-DTU (400SL37) radios in normal transparent mode (M0 and M1 both ON), using
+9600 8N1 and compatible radio settings. The test generates a shared random
+link key in memory for both endpoints:
+
+```sh
+EBYTE_TEST=1 EBYTE_PORT_A=/dev/cu.usbserial-1130 \
+  EBYTE_PORT_B=/dev/cu.usbserial-1110 \
+  go test -v -count=1 -timeout 5m ./ebyte -run 'TestHardware(Raw|Link|Image)$'
+```
+
+The test uses 240-byte frames and a 10-second ACK timeout. To read registers 00–06
+without writing settings, first put **both** radios in configuration mode
+(M1 OFF, M0 ON), then run:
+
+```sh
+EBYTE_TEST=1 EBYTE_CONFIG_MODE=1 EBYTE_PORT_A=/dev/cu.usbserial-1130 \
+  EBYTE_PORT_B=/dev/cu.usbserial-1110 \
+  go test -v -count=1 ./ebyte -run '^TestHardwareRegisters$'
+```
+
+For a one-minute A-to-B throughput and RaptorQ symbol observation:
+
+```sh
+EBYTE_TEST=1 EBYTE_PORT_A=/dev/cu.usbserial-1130 \
+  EBYTE_PORT_B=/dev/cu.usbserial-1110 \
+  go test -v -count=1 -timeout 3m ./ebyte -run '^TestHardwareThroughput$'
+```
+
+The test transmits 512-byte messages and reports application throughput and
+authenticated source and repair symbols observed on each serial port. A
+difference between transmitted and received symbols can include frames still in
+flight at the measurement cutoff; it is not a direct measurement of radio
+packet loss. It does not measure link quality for other message sizes or rates.
+
+Switch both radios back to normal mode before running communication tests.
+The register test cannot compare write-only radio keys. Hardware tests use real
+devices and transmit over the air; install antennas, observe local radio rules,
+and ensure the ports are not in use. They are skipped unless explicitly enabled.
 
 The context passed to `Send` can cancel waiting for the send lock and acknowledgments, but cannot interrupt a blocked underlying `Write`; close the link to interrupt it. Even when `Send` returns an error, the peer may already have received the message. Messages already queued can still be read with `Receive` after the link closes.
 
