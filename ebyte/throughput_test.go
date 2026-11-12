@@ -29,6 +29,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -103,11 +105,13 @@ func decodeCOBS(src []byte) ([]byte, bool) {
 
 type observedStream struct {
 	io.ReadWriteCloser
-	key      []byte
-	read     *frameCounts
-	written  *frameCounts
-	readBuf  []byte
-	writeBuf []byte
+	key             []byte
+	read            *frameCounts
+	written         *frameCounts
+	readBuf         []byte
+	writeBuf        []byte
+	dropFirstSource bool
+	injectedDrops   int
 }
 
 func observe(data []byte, pending *[]byte, counts *frameCounts, key []byte) {
@@ -130,6 +134,15 @@ func (s *observedStream) Read(p []byte) (int, error) {
 }
 
 func (s *observedStream) Write(p []byte) (int, error) {
+	if s.dropFirstSource && len(p) > 1 && p[len(p)-1] == 0 {
+		raw, ok := decodeCOBS(p[:len(p)-1])
+		if ok && len(raw) >= 72 && raw[0] == 1 && raw[1] == 1 &&
+			binary.BigEndian.Uint32(raw[18:22]) == 0 {
+			observe(p, &s.writeBuf, s.written, s.key)
+			s.injectedDrops++
+			return len(p), nil
+		}
+	}
 	n, err := s.ReadWriteCloser.Write(p)
 	observe(p[:n], &s.writeBuf, s.written, s.key)
 	return n, err
@@ -193,6 +206,22 @@ func TestFrameObservation(t *testing.T) {
 // are authenticated locally and do not claim to measure radio-layer loss.
 func TestHardwareThroughput(t *testing.T) {
 	a, b := ports(t)
+	duration := time.Minute
+	if value := os.Getenv("EBYTE_DURATION"); value != "" {
+		var err error
+		duration, err = time.ParseDuration(value)
+		if err != nil || duration <= 0 {
+			t.Fatalf("invalid EBYTE_DURATION: %q", value)
+		}
+	}
+	payloadBytes := 512
+	if value := os.Getenv("EBYTE_PAYLOAD_BYTES"); value != "" {
+		var err error
+		payloadBytes, err = strconv.Atoi(value)
+		if err != nil || payloadBytes < 1 || payloadBytes > 4096 {
+			t.Fatalf("invalid EBYTE_PAYLOAD_BYTES: %q (must be 1-4096)", value)
+		}
+	}
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		t.Fatal(err)
@@ -214,7 +243,17 @@ func TestHardwareThroughput(t *testing.T) {
 	cfg.MaxWireFrameBytes = 240
 	cfg.AckTimeout = 10 * time.Second
 	cfg.MaxRetries = 2
-	left, err := fluid.New(&observedStream{ReadWriteCloser: portA, key: key, read: newFrameCounts(), written: sent}, cfg)
+	if value := os.Getenv("EBYTE_INITIAL_REPAIRS"); value != "" {
+		cfg.InitialRepairSymbols, err = strconv.Atoi(value)
+		if err != nil || cfg.InitialRepairSymbols < 0 {
+			portA.Close()
+			portB.Close()
+			t.Fatalf("invalid EBYTE_INITIAL_REPAIRS: %q", value)
+		}
+	}
+	tx := &observedStream{ReadWriteCloser: portA, key: key, read: newFrameCounts(), written: sent,
+		dropFirstSource: os.Getenv("EBYTE_DROP_FIRST_SOURCE") == "1"}
+	left, err := fluid.New(tx, cfg)
 	if err != nil {
 		portA.Close()
 		portB.Close()
@@ -228,11 +267,11 @@ func TestHardwareThroughput(t *testing.T) {
 	}
 	defer left.Close()
 	defer right.Close()
-	payload := make([]byte, 512)
+	payload := make([]byte, payloadBytes)
 	if _, err := rand.Read(payload); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), duration+45*time.Second)
 	defer cancel()
 	type receiveResult struct {
 		messages int
@@ -257,7 +296,7 @@ func TestHardwareThroughput(t *testing.T) {
 	start := time.Now()
 	acknowledged := 0
 	var sendErr error
-	for ctx.Err() == nil {
+	for time.Since(start) < duration && ctx.Err() == nil {
 		if err := left.Send(ctx, payload); err != nil {
 			sendErr = err
 			break
@@ -278,6 +317,7 @@ func TestHardwareThroughput(t *testing.T) {
 		len(sent.source), len(received.source), countMissing(sent.source, received.source))
 	t.Logf("RaptorQ distinct repair symbols: transmitted=%d received=%d missing=%d",
 		len(sent.repair), len(received.repair), countMissing(sent.repair, received.repair))
+	t.Logf("intentional source symbol drops=%d", tx.injectedDrops)
 	received.mu.Unlock()
 	sent.mu.Unlock()
 	if sendErr != nil && !errors.Is(sendErr, context.DeadlineExceeded) {

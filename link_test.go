@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -53,6 +54,113 @@ func TestDefaultConfig(t *testing.T) {
 	cfg.Key = testKey
 	if _, err := cfg.normalized(); err != nil {
 		t.Fatalf("default config is invalid: %v", err)
+	}
+}
+
+func TestInitialRepairSymbols(t *testing.T) {
+	for _, initial := range []int{0, 1} {
+		t.Run(fmt.Sprintf("initial_%d", initial), func(t *testing.T) {
+			cfg := testConfig()
+			cfg.InitialRepairSymbols = initial
+			cfg.AckTimeout = 400 * time.Millisecond
+			a, b := net.Pipe()
+			var repairs []uint32
+			left, err := New(&filterStream{a, func(packet []byte) []byte {
+				f := frameFromPacket(t, packet)
+				if f.kind == frameData {
+					if f.index == 0 {
+						return nil
+					}
+					if f.index >= 4 {
+						repairs = append(repairs, f.index)
+					}
+				}
+				return packet
+			}}, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			right, err := New(b, cfg)
+			if err != nil {
+				left.Close()
+				t.Fatal(err)
+			}
+			defer left.Close()
+			defer right.Close()
+			payload := bytes.Repeat([]byte{7}, left.symbolSize()*4)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			start := time.Now()
+			if err := left.Send(ctx, payload); err != nil {
+				t.Fatal(err)
+			}
+			elapsed := time.Since(start)
+			got, err := right.Receive(ctx)
+			if err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("receive: %v", err)
+			}
+			if len(repairs) == 0 || repairs[0] != 4 {
+				t.Fatalf("unexpected repair symbols: %v", repairs)
+			}
+			if initial == 0 && elapsed < cfg.AckTimeout {
+				t.Fatalf("repair sent before timeout: %s", elapsed)
+			}
+			if initial == 1 && elapsed >= cfg.AckTimeout {
+				t.Fatalf("proactive repair did not avoid ACK timeout: %s", elapsed)
+			}
+		})
+	}
+}
+
+func TestInvalidInitialRepairSymbols(t *testing.T) {
+	for _, value := range []int{-1, maxSymbolIDLimit + 1} {
+		cfg := testConfig()
+		cfg.InitialRepairSymbols = value
+		if _, err := cfg.normalized(); err == nil {
+			t.Fatalf("expected error for InitialRepairSymbols=%d", value)
+		}
+	}
+}
+
+func TestInitialRepairContinuesWithNewRepairIDs(t *testing.T) {
+	cfg := testConfig()
+	cfg.InitialRepairSymbols = 1
+	a, b := net.Pipe()
+	var repairs []uint32
+	left, err := New(&filterStream{a, func(packet []byte) []byte {
+		f := frameFromPacket(t, packet)
+		if f.kind == frameData {
+			if f.index >= 4 {
+				repairs = append(repairs, f.index)
+			}
+			if f.index == 0 || f.index == 4 {
+				return nil
+			}
+		}
+		return packet
+	}}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := New(b, cfg)
+	if err != nil {
+		left.Close()
+		t.Fatal(err)
+	}
+	defer left.Close()
+	defer right.Close()
+	payload := bytes.Repeat([]byte{7}, left.symbolSize()*4)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := left.Send(ctx, payload); err != nil {
+		t.Fatal(err)
+	}
+	got, err := right.Receive(ctx)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("receive: %v", err)
+	}
+	if len(repairs) < 2 || repairs[0] != 4 || repairs[1] != 5 {
+		t.Fatalf("repair IDs not advanced after lost proactive repair: %v", repairs)
 	}
 }
 

@@ -119,6 +119,16 @@ authenticated source and repair symbols observed on each serial port. A
 difference between transmitted and received symbols can include frames still in
 flight at the measurement cutoff; it is not a direct measurement of radio
 packet loss. It does not measure link quality for other message sizes or rates.
+The test starts new messages for one minute by default and waits for the last
+message to finish, so the reported elapsed time may exceed one minute. Use
+`EBYTE_DURATION=20s` and `EBYTE_PAYLOAD_BYTES=512` to vary the test. For a
+controlled recovery test, set `EBYTE_DROP_FIRST_SOURCE=1` to discard the first
+source symbol of every message at the sender before it reaches the radio.
+`EBYTE_INITIAL_REPAIRS=1` enables one proactive repair symbol per chunk.
+Transmitted counts include the intentionally discarded frames; this models
+loss but does not measure radio-layer loss. Compare runs with and without
+proactive repairs on the actual device: extra frames can increase buffering,
+airtime and half-duplex collisions even on a clean link.
 
 Switch both radios back to normal mode before running communication tests.
 The register test cannot compare write-only radio keys. Hardware tests use real
@@ -140,6 +150,7 @@ The serial port uses 8N1. Configure the module's frequency, radio parameters, an
 | `MaxChunkBytes` | 32 KiB | Maximum input bytes for each independent RaptorQ generation |
 | `AckTimeout` | 3 seconds | Time to wait for a chunk or message-completion acknowledgment after a source stream or repair batch |
 | `MaxRetries` | 5 | Maximum additional repair-symbol batches per chunk after its initial source-symbol stream |
+| `InitialRepairSymbols` | 0 | Maximum proactive repair symbols sent after each source stream before waiting for an ACK |
 | `ReceiveTimeout` | 2 minutes | Retention time for an incomplete message without a valid fragment |
 | `ReplayWindow` | 10 minutes | Retention time for completed message IDs used for deduplication |
 
@@ -149,6 +160,7 @@ Each RaptorQ chunk can contain at most 56403 source symbols; repair symbols use 
 
 - Frames use COBS encoding with a zero-byte delimiter. The version, type, 128-bit message ID (a random 64-bit link instance ID and 64-bit message ID), symbol ID, complete message length, chunk length/index/count, symbol size, and symbol content are protected by HMAC. The receiver verifies this HMAC before passing each source or repair symbol to RaptorQ. Chunk and final acknowledgment frames are authenticated and bound to the message and chunk metadata. Corrupt, unauthenticated, or invalid frames are discarded without acknowledgment. The link also ignores its own echoed data frames to avoid mistaking them for peer acknowledgments.
 - The sender splits each application message into ordered chunks. Each chunk gets an independent RaptorQ generation; its source symbols are streamed without per-symbol acknowledgments, followed by progressively larger batches of new repair symbols if needed. A chunk ACK advances to the next generation; the final message-completion ACK is sent only after all chunks are reassembled and queued. `MaxRetries` applies per chunk.
+- Optionally, `InitialRepairSymbols` sends repair symbols before the first ACK wait. This can reduce timeout latency when symbols are lost, but adds traffic and can cause collisions or overflow radio buffers. It is disabled by default and does not change the wire format or need matching configuration at the receiver. The sender may stop early upon receiving an ACK; later repair batches use fresh symbol IDs.
 - The receiver accepts source and repair symbols for the active chunk in any order and acknowledges completed non-final chunks so the sender can proceed. It sends a final message-completion acknowledgment only after the complete application message is reassembled and queued. Retries of completed chunks or messages are acknowledged without duplicate delivery. A successful `Send` means the receiving link layer has reassembled and queued the entire message; it **does not mean the application has read or processed it**. `Receive` should be called continuously to consume messages. When the queue is full, the final message is not acknowledged; a later repair symbol retries queueing.
 - Each endpoint can handle at most one outgoing and one incoming message at a time; concurrent `Send` calls queue locally. An incoming message canceled or abandoned by its sender occupies the receiver until `ReceiveTimeout`; other messages are not acknowledged during that time.
 - Completed message IDs are retained in memory for `ReplayWindow`, so retries with the same ID are not delivered twice. At most 128 unexpired IDs are retained; when the limit is reached, new messages are not acknowledged until an entry expires. This is not persistent replay protection: old messages may be received again after the window expires or the process restarts. A send timeout or cancellation can also occur after the peer has received the message. Applications requiring exactly-once processing across restarts must maintain persistent message IDs and deduplication themselves.

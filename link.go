@@ -71,6 +71,12 @@ type Config struct {
 	// MaxRetries is the maximum number of repair-symbol batches per chunk after
 	// the initial source-symbol stream. Zero defaults to 5.
 	MaxRetries int
+	// InitialRepairSymbols is the number of repair symbols sent immediately
+	// after each source-symbol stream, before waiting for an acknowledgment.
+	// Zero disables proactive repairs. The sender stops early if it receives an
+	// acknowledgment; radio buffering and half-duplex turnaround may require
+	// a small value or zero.
+	InitialRepairSymbols int
 	// ReceiveTimeout is the maximum idle time before an incomplete incoming
 	// message is discarded. Zero defaults to 2 minutes.
 	ReceiveTimeout time.Duration
@@ -125,7 +131,9 @@ func (c Config) normalized() (Config, error) {
 	if c.MaxWireFrameBytes < 76 || c.MaxWireFrameBytes > 65535 ||
 		c.MaxAppMessageBytes < 1 || uint64(c.MaxAppMessageBytes) > uint64(^uint32(0))-65535 ||
 		c.MaxChunkBytes < 1 || uint64(c.MaxChunkBytes) > uint64(^uint32(0)) ||
-		c.AckTimeout < 0 || c.MaxRetries < 0 || c.ReceiveTimeout < 0 || c.ReplayWindow < 0 {
+		c.AckTimeout < 0 || c.MaxRetries < 0 || c.InitialRepairSymbols < 0 ||
+		uint64(c.InitialRepairSymbols) > maxSymbolIDLimit ||
+		c.ReceiveTimeout < 0 || c.ReplayWindow < 0 {
 		return c, errors.New("invalid link configuration")
 	}
 	return c, nil
@@ -377,6 +385,24 @@ func (l *Link) sendChunk(ctx context.Context, f frame, enc *raptorq.Encoder) (bo
 		}
 	}
 
+	nextRepair := sourceSymbols
+	initialEnd := uint64(nextRepair) + uint64(l.cfg.InitialRepairSymbols)
+	if initialEnd > maxSymbolIDLimit {
+		initialEnd = maxSymbolIDLimit
+	}
+	for uint64(nextRepair) < initialEnd {
+		if acked, err := l.checkChunkAck(ctx, f); err != nil {
+			return false, err
+		} else if acked {
+			return true, nil
+		}
+		f.index = nextRepair
+		f.payload = enc.GenSymbol(f.index)
+		if err := l.write(f); err != nil {
+			return false, fmt.Errorf("send initial repair symbol %d of chunk %d: %w", f.index, f.chunkIndex, err)
+		}
+		nextRepair++
+	}
 	if acked, err := l.waitChunkAck(ctx, f); err != nil {
 		return false, err
 	} else if acked {
@@ -385,7 +411,6 @@ func (l *Link) sendChunk(ctx context.Context, f frame, enc *raptorq.Encoder) (bo
 
 	// Add repair symbols in progressively larger batches until decoding is
 	// acknowledged or the retry budget is exhausted.
-	nextRepair := sourceSymbols
 	batchSize := (sourceSymbols + 3) / 4
 	if batchSize == 0 {
 		batchSize = 1
