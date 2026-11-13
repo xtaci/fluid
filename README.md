@@ -6,9 +6,6 @@ A Go transport for transparent LoRa serial modules. It provides a bounded,
 coordinated bidirectional byte stream over an authenticated RaptorQ message
 link. Frames use HMAC-MD5; its 16-byte tag reduces overhead compared with
 HMAC-SHA-256, but MD5 is a legacy hash and has a lower security margin.
-The current protocol uses version 1. Its frame layout and HMAC-MD5
-authentication differ from earlier implementations, including earlier
-version 1 frames; upgrade both endpoints together.
 
 ## Usage
 
