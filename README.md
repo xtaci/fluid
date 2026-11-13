@@ -1,5 +1,6 @@
 # fluid
-<img width="1747" height="985" alt="3cea160e4c9c1bf363617d6127a58ea7" src="https://github.com/user-attachments/assets/62c06356-2cc0-48d2-9a99-9735b3a5ccc3" />
+
+<img width="1362" height="768" alt="ebyte" src="https://github.com/user-attachments/assets/54e8bcae-ed10-4a23-9745-aa75df9cb9eb" />
 
 A Go transport for transparent LoRa serial modules. It provides a bounded,
 coordinated bidirectional byte stream over an authenticated RaptorQ message
