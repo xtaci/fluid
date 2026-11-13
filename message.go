@@ -133,10 +133,10 @@ func (c Config) normalized() (Config, error) {
 	return c, nil
 }
 
-// Message owns its stream. Close must unblock concurrent Read and Write calls.
+// Message owns its port. Close must unblock concurrent Read and Write calls.
 // One outgoing and one incoming message may be in progress at a time.
 type Message struct {
-	stream   io.ReadWriteCloser
+	port     io.ReadWriteCloser
 	cfg      Config
 	key      *memguard.LockedBuffer
 	origin   [8]byte
@@ -175,12 +175,12 @@ func Open(port string, baudRate int, cfg Config) (*Message, error) {
 }
 
 // New starts a message transport over a transparent byte stream and takes
-// ownership of it on success. The stream's Close method must unblock pending
+// ownership of the port on success. The port's Close method must unblock pending
 // reads and writes. The key is copied into protected memory; the caller retains
 // ownership of the original key slice.
-func New(stream io.ReadWriteCloser, cfg Config) (*Message, error) {
-	if stream == nil {
-		return nil, errors.New("nil stream")
+func New(port io.ReadWriteCloser, cfg Config) (*Message, error) {
+	if port == nil {
+		return nil, errors.New("nil port")
 	}
 	cfg, err := cfg.normalized()
 	if err != nil {
@@ -194,7 +194,7 @@ func New(stream io.ReadWriteCloser, cfg Config) (*Message, error) {
 	copy(key.Bytes(), cfg.Key)
 	key.Freeze()
 	cfg.Key = nil
-	l := &Message{stream: stream, cfg: cfg, sendMu: make(chan struct{}, 1),
+	l := &Message{port: port, cfg: cfg, sendMu: make(chan struct{}, 1),
 		key: key, acks: make(chan frame, 1), messages: make(chan []byte, 1), done: make(chan struct{})}
 	if _, err := rand.Read(l.origin[:]); err != nil {
 		key.Destroy()
@@ -205,8 +205,8 @@ func New(stream io.ReadWriteCloser, cfg Config) (*Message, error) {
 	return l, nil
 }
 
-// Close closes the underlying stream and unblocks pending operations. It
-// returns any previously recorded terminal error or stream-close error.
+// Close closes the underlying port and unblocks pending operations. It
+// returns any previously recorded terminal error or port-close error.
 func (l *Message) Close() error {
 	l.fail(io.ErrClosedPipe)
 	if err := l.failure(); err != io.ErrClosedPipe {
@@ -215,18 +215,18 @@ func (l *Message) Close() error {
 	return nil
 }
 
-// fail records the first terminal error, closes the stream exactly once, and
+// fail records the first terminal error, closes the port exactly once, and
 // destroys the protected key after in-flight cryptographic operations finish.
 func (l *Message) fail(err error) {
 	l.once.Do(func() {
 		l.mu.Lock()
 		l.err = err
 		l.mu.Unlock()
-		// Wake waiters and unblock stream I/O before waiting for key users.
+		// Wake waiters and unblock port I/O before waiting for key users.
 		close(l.done)
-		if closeErr := l.stream.Close(); closeErr != nil {
+		if closeErr := l.port.Close(); closeErr != nil {
 			l.mu.Lock()
-			l.err = errors.Join(l.err, fmt.Errorf("close stream: %w", closeErr))
+			l.err = errors.Join(l.err, fmt.Errorf("close port: %w", closeErr))
 			l.mu.Unlock()
 		}
 		l.keyMu.Lock()
@@ -245,7 +245,7 @@ func (l *Message) failure() error {
 }
 
 // write authenticates and writes a frame without interleaving other frames.
-// A stream write failure is terminal for the Message.
+// A port write failure is terminal for the Message.
 func (l *Message) write(f frame) error {
 	select {
 	case <-l.done:
@@ -273,9 +273,9 @@ func (l *Message) write(f frame) error {
 	l.writeMu.Lock()
 	defer l.writeMu.Unlock()
 	for len(packet) > 0 {
-		n, err := l.stream.Write(packet)
+		n, err := l.port.Write(packet)
 		if err != nil {
-			l.fail(fmt.Errorf("write stream: %w", err))
+			l.fail(fmt.Errorf("write port: %w", err))
 			return l.failure()
 		}
 		if n <= 0 || n > len(packet) {
@@ -545,7 +545,7 @@ func (l *Message) readLoop() {
 	packet := make([]byte, 0, l.cfg.MaxWireFrameBytes)
 	overflow := false
 	for {
-		n, err := l.stream.Read(buf)
+		n, err := l.port.Read(buf)
 		// Discard an oversized packet until the next delimiter to resynchronize.
 		for _, b := range buf[:n] {
 			if b != 0 {
@@ -579,7 +579,7 @@ func (l *Message) readLoop() {
 		}
 		// Process bytes returned with an error before terminating the transport.
 		if err != nil {
-			l.fail(fmt.Errorf("read stream: %w", err))
+			l.fail(fmt.Errorf("read port: %w", err))
 			return
 		}
 		if n == 0 {
